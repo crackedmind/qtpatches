@@ -1,0 +1,46 @@
+diff --git a/src/network/access/qhttp2protocolhandler.cpp b/src/network/access/qhttp2protocolhandler.cpp
+index 9867aa133f..5bc38497a2 100644
+--- a/src/network/access/qhttp2protocolhandler.cpp
++++ b/src/network/access/qhttp2protocolhandler.cpp
+@@ -159,9 +159,9 @@ bool sum_will_overflow(qint32 windowSize, qint32 delta)
+ using namespace Http2;
+ 
+ const std::deque<quint32>::size_type QHttp2ProtocolHandler::maxRecycledStreams = 10000;
+-const qint32 QHttp2ProtocolHandler::sessionMaxRecvWindowSize;
+-const qint32 QHttp2ProtocolHandler::streamInitialRecvWindowSize;
+-const quint32 QHttp2ProtocolHandler::maxAcceptableTableSize;
++const qint32 QHttp2ProtocolHandler::sessionMaxRecvWindowSize = Http2::defaultSessionWindowSize * 10;
++const qint32 QHttp2ProtocolHandler::streamInitialRecvWindowSize = Http2::defaultSessionWindowSize;
++const quint32 QHttp2ProtocolHandler::maxAcceptableTableSize = 16 * HPack::FieldLookupTable::DefaultSize;
+ 
+ QHttp2ProtocolHandler::QHttp2ProtocolHandler(QHttpNetworkConnectionChannel *channel)
+     : QAbstractProtocolHandler(channel),
+diff --git a/src/network/access/qhttp2protocolhandler_p.h b/src/network/access/qhttp2protocolhandler_p.h
+index e0c2275078..8e85a267e1 100644
+--- a/src/network/access/qhttp2protocolhandler_p.h
++++ b/src/network/access/qhttp2protocolhandler_p.h
+@@ -150,7 +150,7 @@ private:
+     // the client's preface 24-byte message.
+     bool waitingForSettingsACK = false;
+ 
+-    static const quint32 maxAcceptableTableSize = 16 * HPack::FieldLookupTable::DefaultSize;
++    static const quint32 maxAcceptableTableSize;
+     // HTTP/2 4.3: Header compression is stateful. One compression context and
+     // one decompression context are used for the entire connection.
+     HPack::Decoder decoder;
+@@ -176,13 +176,13 @@ private:
+     quint32 maxConcurrentStreams = Http2::maxConcurrentStreams;
+ 
+     // Control flow:
+-    static const qint32 sessionMaxRecvWindowSize = Http2::defaultSessionWindowSize * 10;
++    static const qint32 sessionMaxRecvWindowSize;
+     // Signed integer, it can become negative (it's still a valid window size):
+     qint32 sessionRecvWindowSize = sessionMaxRecvWindowSize;
+ 
+     // We do not negotiate this window size
+     // We have to send WINDOW_UPDATE frames to our peer also.
+-    static const qint32 streamInitialRecvWindowSize = Http2::defaultSessionWindowSize;
++    static const qint32 streamInitialRecvWindowSize;
+ 
+     // Updated by SETTINGS and WINDOW_UPDATE.
+     qint32 sessionSendWindowSize = Http2::defaultSessionWindowSize;

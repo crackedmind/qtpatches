@@ -1,0 +1,413 @@
+diff --git a/src/corelib/io/qfilesystemengine_win.cpp b/src/corelib/io/qfilesystemengine_win.cpp
+index c9a56a81cc..e031a8d296 100644
+--- a/src/corelib/io/qfilesystemengine_win.cpp
++++ b/src/corelib/io/qfilesystemengine_win.cpp
+@@ -576,7 +576,11 @@ QFileSystemEntry QFileSystemEngine::absoluteName(const QFileSystemEntry &entry)
+     return QFileSystemEntry(ret, QFileSystemEntry::FromInternalPath());
+ }
+ 
+-#if defined(Q_CC_MINGW) && WINVER < 0x0602 //  Windows 8 onwards
++#  if defined(Q_CC_MINGW) || (defined(Q_CC_MSVC) && (_MSC_VER < 1700 || WINVER <= 0x0601)) //  Windows 8 onwards
++
++typedef struct _FILE_ID_128 {
++    BYTE  Identifier[16];
++} FILE_ID_128, *PFILE_ID_128;
+ 
+ typedef struct _FILE_ID_INFO {
+     ULONGLONG VolumeSerialNumber;
+@@ -604,25 +608,32 @@ static inline QByteArray fileId(HANDLE handle)
+ #endif // Q_OS_WINRT
+     return QByteArray();
+ }
++// FILE_INFO_BY_HANDLE_CLASS has been extended by FileIdInfo = 18 as of VS2012.
++typedef enum { Q_FileIdInfo = 18 } Q_FILE_INFO_BY_HANDLE_CLASS;
+ 
+ // File ID for Windows starting from version 8.
+ QByteArray fileIdWin8(HANDLE handle)
+ {
+-#if !defined(QT_BOOTSTRAPPED) && !defined(QT_BUILD_QMAKE)
++    typedef BOOL (WINAPI* GetFileInformationByHandleExType)(HANDLE, Q_FILE_INFO_BY_HANDLE_CLASS, void *, DWORD);
++
++    // Dynamically resolve  GetFileInformationByHandleEx (Vista onwards).
++    static GetFileInformationByHandleExType getFileInformationByHandleEx = 0;
++    if (!getFileInformationByHandleEx) {
++        QSystemLibrary library(QLatin1String("kernel32"));
++        getFileInformationByHandleEx = (GetFileInformationByHandleExType)library.resolve("GetFileInformationByHandleEx");
++    }
+     QByteArray result;
+-    FILE_ID_INFO infoEx;
+-    if (GetFileInformationByHandleEx(handle,
+-                                     static_cast<FILE_INFO_BY_HANDLE_CLASS>(18), // FileIdInfo in Windows 8
+-                                     &infoEx, sizeof(FILE_ID_INFO))) {
+-        result = QByteArray::number(infoEx.VolumeSerialNumber, 16);
+-        result += ':';
+-        // Note: MinGW-64's definition of FILE_ID_128 differs from the MSVC one.
+-        result += QByteArray(reinterpret_cast<const char *>(&infoEx.FileId), int(sizeof(infoEx.FileId))).toHex();
++    if (getFileInformationByHandleEx) {
++        FILE_ID_INFO infoEx;
++        if (getFileInformationByHandleEx(handle, Q_FileIdInfo,
++                                         &infoEx, sizeof(FILE_ID_INFO))) {
++            result = QByteArray::number(infoEx.VolumeSerialNumber, 16);
++            result += ':';
++            // Note: MinGW-64's definition of FILE_ID_128 differs from the MSVC one.
++            result += QByteArray((char *)&infoEx.FileId, sizeof(infoEx.FileId)).toHex();
++        }
+     }
+     return result;
+-#else // !QT_BOOTSTRAPPED && !QT_BUILD_QMAKE
+-    return fileId(handle);
+-#endif
+ }
+ 
+ //static
+diff --git a/src/corelib/io/qsettings.cpp b/src/corelib/io/qsettings.cpp
+index 9b930e7e14..23d4982ed4 100644
+--- a/src/corelib/io/qsettings.cpp
++++ b/src/corelib/io/qsettings.cpp
+@@ -97,6 +97,15 @@ using namespace ABI::Windows::Foundation;
+ using namespace ABI::Windows::Storage;
+ #endif
+ 
++#ifndef CSIDL_COMMON_APPDATA
++#define CSIDL_COMMON_APPDATA    0x0023  // All Users\Application Data
++#endif
++
++#ifndef CSIDL_APPDATA
++#define CSIDL_APPDATA           0x001a  // <username>\Application Data
++#endif
++
++
+ #if defined(Q_OS_UNIX) && !defined(Q_OS_MAC) && !defined(Q_OS_ANDROID)
+ #define Q_XDG_PLATFORM
+ #endif
+@@ -961,65 +970,25 @@ void QConfFileSettingsPrivate::initAccess()
+     sync();       // loads the files the first time
+ }
+ 
+-#if defined(Q_OS_WIN) && !defined(Q_OS_WINRT)
+-static QString windowsConfigPath(const KNOWNFOLDERID &type)
++static QString windowsConfigPath(int type)
+ {
+     QString result;
+ 
+-    PWSTR path = nullptr;
+-    if (SHGetKnownFolderPath(type, KF_FLAG_DONT_VERIFY, NULL, &path) == S_OK) {
++    wchar_t path[MAX_PATH];
++    if (SHGetSpecialFolderPath(0, path, type, false)) {
+         result = QString::fromWCharArray(path);
+-        CoTaskMemFree(path);
+     }
+ 
+     if (result.isEmpty()) {
+-        if (type == FOLDERID_ProgramData) {
++        if (type == CSIDL_COMMON_APPDATA) {
+             result = QLatin1String("C:\\temp\\qt-common");
+-        } else if (type == FOLDERID_RoamingAppData) {
++        } else if (type == CSIDL_APPDATA) {
+             result = QLatin1String("C:\\temp\\qt-user");
+         }
+     }
+ 
+     return result;
+ }
+-#elif defined(Q_OS_WINRT) // Q_OS_WIN && !Q_OS_WINRT
+-
+-enum ConfigPathType {
+-    ConfigPath_CommonAppData,
+-    ConfigPath_UserAppData
+-};
+-
+-static QString windowsConfigPath(ConfigPathType type)
+-{
+-    static QString result;
+-    while (result.isEmpty()) {
+-        ComPtr<IApplicationDataStatics> applicationDataStatics;
+-        if (FAILED(GetActivationFactory(HString::MakeReference(RuntimeClass_Windows_Storage_ApplicationData).Get(), &applicationDataStatics)))
+-            return result;
+-        ComPtr<IApplicationData> applicationData;
+-        if (FAILED(applicationDataStatics->get_Current(&applicationData)))
+-            return result;
+-        ComPtr<IStorageFolder> localFolder;
+-        if (FAILED(applicationData->get_LocalFolder(&localFolder)))
+-            return result;
+-        ComPtr<IStorageItem> localFolderItem;
+-        if (FAILED(localFolder.As(&localFolderItem)))
+-            return result;
+-        HString path;
+-        if (FAILED(localFolderItem->get_Path(path.GetAddressOf())))
+-            return result;
+-        result = QString::fromWCharArray(path.GetRawBuffer(nullptr));
+-    }
+-
+-    switch (type) {
+-    case ConfigPath_CommonAppData:
+-        return result + QLatin1String("\\qt-common");
+-    case ConfigPath_UserAppData:
+-        return result + QLatin1String("\\qt-user");
+-    }
+-    return result;
+-}
+-#endif // Q_OS_WINRT
+ 
+ static inline int pathHashKey(QSettings::Format format, QSettings::Scope scope)
+ {
+@@ -1073,13 +1042,9 @@ static void initDefaultPaths(QMutexLocker *locker)
+        */
+ #ifdef Q_OS_WIN
+ 
+-#  ifdef Q_OS_WINRT
+-        const QString roamingAppDataFolder = windowsConfigPath(ConfigPath_UserAppData);
+-        const QString programDataFolder = windowsConfigPath(ConfigPath_CommonAppData);
+-#  else
+-        const QString roamingAppDataFolder = windowsConfigPath(FOLDERID_RoamingAppData);
+-        const QString programDataFolder = windowsConfigPath(FOLDERID_ProgramData);
+-#  endif
++        const QString roamingAppDataFolder = windowsConfigPath(CSIDL_APPDATA);
++        const QString programDataFolder = windowsConfigPath(CSIDL_COMMON_APPDATA);
++
+         pathHash->insert(pathHashKey(QSettings::IniFormat, QSettings::UserScope),
+                          Path(roamingAppDataFolder + QDir::separator(), false));
+         pathHash->insert(pathHashKey(QSettings::IniFormat, QSettings::SystemScope),
+diff --git a/src/corelib/io/qstandardpaths_win.cpp b/src/corelib/io/qstandardpaths_win.cpp
+index 80e855696f..f8208ecd4a 100644
+--- a/src/corelib/io/qstandardpaths_win.cpp
++++ b/src/corelib/io/qstandardpaths_win.cpp
+@@ -138,7 +138,7 @@ static QString sHGetKnownFolderPath(const GUID &clsid)
+         reinterpret_cast<GetKnownFolderPath>(QSystemLibrary::resolve(QLatin1String("shell32"), "SHGetKnownFolderPath"));
+ 
+     LPWSTR path;
+-    if (Q_LIKELY(sHGetKnownFolderPath && SUCCEEDED(sHGetKnownFolderPath(clsid, KF_FLAG_DONT_VERIFY, 0, &path)))) {
++    if (Q_LIKELY(sHGetKnownFolderPath && SUCCEEDED(sHGetKnownFolderPath(clsid, 0, 0, &path)))) {
+         result = convertCharArray(path);
+         CoTaskMemFree(path);
+     }
+diff --git a/src/corelib/io/qwindowspipereader.cpp b/src/corelib/io/qwindowspipereader.cpp
+index b93fed5ba8..ec9a41a82a 100644
+--- a/src/corelib/io/qwindowspipereader.cpp
++++ b/src/corelib/io/qwindowspipereader.cpp
+@@ -71,6 +71,21 @@ QWindowsPipeReader::QWindowsPipeReader(QObject *parent)
+             this, &QWindowsPipeReader::emitPendingReadyRead, Qt::QueuedConnection);
+ }
+ 
++bool qt_cancelIo(HANDLE handle, OVERLAPPED *overlapped)
++{
++    typedef BOOL (WINAPI *PtrCancelIoEx)(HANDLE, LPOVERLAPPED);
++    static PtrCancelIoEx ptrCancelIoEx = 0;
++    if (!ptrCancelIoEx) {
++        HMODULE kernel32 = GetModuleHandleA("kernel32");
++        if (kernel32)
++            ptrCancelIoEx = PtrCancelIoEx(GetProcAddress(kernel32, "CancelIoEx"));
++    }
++    if (ptrCancelIoEx)
++        return ptrCancelIoEx(handle, overlapped);
++    else
++        return CancelIo(handle);
++}
++
+ QWindowsPipeReader::~QWindowsPipeReader()
+ {
+     stop();
+@@ -97,7 +112,7 @@ void QWindowsPipeReader::stop()
+     stopped = true;
+     if (readSequenceStarted) {
+         overlapped->pipeReader = nullptr;
+-        if (!CancelIoEx(handle, overlapped)) {
++        if (!qt_cancelIo(handle, overlapped)) {
+             const DWORD dwError = GetLastError();
+             if (dwError != ERROR_NOT_FOUND) {
+                 qErrnoWarning(dwError, "QWindowsPipeReader: CancelIoEx on handle %p failed.",
+diff --git a/src/corelib/io/qwindowspipewriter.cpp b/src/corelib/io/qwindowspipewriter.cpp
+index 846891102f..23780dce77 100644
+--- a/src/corelib/io/qwindowspipewriter.cpp
++++ b/src/corelib/io/qwindowspipewriter.cpp
+@@ -42,6 +42,8 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++extern bool qt_cancelIo(HANDLE handle, OVERLAPPED *overlapped);     // from qwindowspipereader.cpp
++
+ QWindowsPipeWriter::Overlapped::Overlapped(QWindowsPipeWriter *pipeWriter)
+     : pipeWriter(pipeWriter)
+ {
+@@ -223,7 +225,7 @@ void QWindowsPipeWriter::stop()
+     pendingBytesWrittenValue = 0;
+     if (writeSequenceStarted) {
+         overlapped->pipeWriter = nullptr;
+-        if (!CancelIoEx(handle, overlapped)) {
++        if (!qt_cancelIo(handle, overlapped)) {
+             const DWORD dwError = GetLastError();
+             if (dwError != ERROR_NOT_FOUND) {
+                 qErrnoWarning(dwError, "QWindowsPipeWriter: CancelIoEx on handle %p failed.",
+diff --git a/src/corelib/kernel/qelapsedtimer_win.cpp b/src/corelib/kernel/qelapsedtimer_win.cpp
+index 0c380b2f6a..bb298e1601 100644
+--- a/src/corelib/kernel/qelapsedtimer_win.cpp
++++ b/src/corelib/kernel/qelapsedtimer_win.cpp
+@@ -42,11 +42,33 @@
+ #include "qdeadlinetimer_p.h"
+ #include <qt_windows.h>
+ 
++typedef ULONGLONG (WINAPI *PtrGetTickCount64)(void);
++#if defined(Q_OS_WINRT)
++    static const PtrGetTickCount64 ptrGetTickCount64 = &GetTickCount64;
++#else
++    static PtrGetTickCount64 ptrGetTickCount64 = 0;
++#endif
++
+ QT_BEGIN_NAMESPACE
+ 
+ // Result of QueryPerformanceFrequency, 0 indicates that the high resolution timer is unavailable
+ static quint64 counterFrequency = 0;
+ 
++static void resolveLibs()
++{
++    static bool done = false;
++    if (done)
++        return;
++
++#if !defined(Q_OS_WINRT)
++    // try to get GetTickCount64 from the system
++    HMODULE kernel32 = GetModuleHandleW(L"kernel32");
++    if (!kernel32)
++        return;
++    ptrGetTickCount64 = (PtrGetTickCount64)GetProcAddress(kernel32, "GetTickCount64");
++#endif // !Q_OS_WINRT
++}
++
+ static void resolveCounterFrequency()
+ {
+     static bool done = false;
+@@ -91,6 +113,7 @@ static inline qint64 nanosecondsToTicks(qint64 nsec)
+ 
+ static quint64 getTickCount()
+ {
++    resolveLibs();
+     resolveCounterFrequency();
+ 
+     // This avoids a division by zero and disables the high performance counter if it's not available
+@@ -104,7 +127,21 @@ static quint64 getTickCount()
+         return counter.QuadPart;
+     }
+ 
+-    return GetTickCount64();
++#ifndef Q_OS_WINRT
++    if (ptrGetTickCount64)
++        return ptrGetTickCount64();
++
++    static quint32 highdword = 0;
++    static quint32 lastval = 0;
++    quint32 val = GetTickCount();
++    if (val < lastval)
++        ++highdword;
++    lastval = val;
++    return val | (quint64(highdword) << 32);
++#else // !Q_OS_WINRT
++    // ptrGetTickCount64 is always set on WinRT but GetTickCount is not available
++    return ptrGetTickCount64();
++#endif // Q_OS_WINRT
+ }
+ 
+ quint64 qt_msectime()
+@@ -114,6 +151,7 @@ quint64 qt_msectime()
+ 
+ QElapsedTimer::ClockType QElapsedTimer::clockType() Q_DECL_NOTHROW
+ {
++    resolveLibs();
+     resolveCounterFrequency();
+ 
+     if (counterFrequency > 0)
+diff --git a/src/corelib/tools/qlocale_win.cpp b/src/corelib/tools/qlocale_win.cpp
+index 2475859abd..d672ef6520 100644
+--- a/src/corelib/tools/qlocale_win.cpp
++++ b/src/corelib/tools/qlocale_win.cpp
+@@ -44,6 +44,9 @@
+ #include "qstringlist.h"
+ #include "qvariant.h"
+ #include "qdatetime.h"
++
++#include "private/qsystemlibrary_p.h"
++
+ #include "qdebug.h"
+ 
+ #ifdef Q_OS_WIN
+@@ -64,6 +67,7 @@ QT_BEGIN_NAMESPACE
+ 
+ #ifndef Q_OS_WINRT
+ static QByteArray getWinLocaleName(LCID id = LOCALE_USER_DEFAULT);
++static const char *winLangCodeToIsoName(int code);
+ static QString winIso639LangName(LCID id = LOCALE_USER_DEFAULT);
+ static QString winIso3116CtryName(LCID id = LOCALE_USER_DEFAULT);
+ #else // !Q_OS_WINRT
+@@ -597,32 +601,50 @@ QVariant QSystemLocalePrivate::toCurrencyString(const QSystemLocale::CurrencyToS
+ 
+ QVariant QSystemLocalePrivate::uiLanguages()
+ {
++    if (QSysInfo::windowsVersion() >= QSysInfo::WV_VISTA) {
++        typedef BOOL (WINAPI *GetUserPreferredUILanguagesFunc) (
++                    DWORD dwFlags,
++                    PULONG pulNumLanguages,
++                    PWSTR pwszLanguagesBuffer,
++                    PULONG pcchLanguagesBuffer);
++        static GetUserPreferredUILanguagesFunc GetUserPreferredUILanguages_ptr = 0;
+ #ifndef Q_OS_WINRT
+-    unsigned long cnt = 0;
+-    QVarLengthArray<wchar_t, 64> buf(64);
+-#  if !defined(QT_BOOTSTRAPPED) && !defined(QT_BUILD_QMAKE) // Not present in MinGW 4.9/bootstrap builds.
+-    unsigned long size = buf.size();
+-    if (!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &cnt, buf.data(), &size)) {
+-        size = 0;
+-        if (GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
+-                GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &cnt, NULL, &size)) {
+-            buf.resize(size);
+-            if (!GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &cnt, buf.data(), &size))
+-                return QStringList();
++        if (!GetUserPreferredUILanguages_ptr) {
++            QSystemLibrary lib(QLatin1String("kernel32"));
++            if (lib.load())
++                GetUserPreferredUILanguages_ptr = (GetUserPreferredUILanguagesFunc)lib.resolve("GetUserPreferredUILanguages");
++        }
++#endif // !Q_OS_WINRT
++        if (GetUserPreferredUILanguages_ptr) {
++            unsigned long cnt = 0;
++            QVarLengthArray<wchar_t, 64> buf(64);
++            unsigned long size = buf.size();
++            if (!GetUserPreferredUILanguages_ptr(MUI_LANGUAGE_NAME, &cnt, buf.data(), &size)) {
++                size = 0;
++                if (GetLastError() == ERROR_INSUFFICIENT_BUFFER &&
++                    GetUserPreferredUILanguages_ptr(MUI_LANGUAGE_NAME, &cnt, NULL, &size)) {
++                    buf.resize(size);
++                    if (!GetUserPreferredUILanguages_ptr(MUI_LANGUAGE_NAME, &cnt, buf.data(), &size))
++                        return QStringList();
++                }
++            }
++            QStringList result;
++            result.reserve(cnt);
++            const wchar_t *str = buf.constData();
++            for (; cnt > 0; --cnt) {
++                QString s = QString::fromWCharArray(str);
++                if (s.isEmpty())
++                    break; // something is wrong
++                result.append(s);
++                str += s.size()+1;
++            }
++            return result;
+         }
+     }
+-#  endif // !QT_BOOTSTRAPPED && !QT_BUILD_QMAKE
+-    QStringList result;
+-    result.reserve(cnt);
+-    const wchar_t *str = buf.constData();
+-    for (; cnt > 0; --cnt) {
+-        QString s = QString::fromWCharArray(str);
+-        if (s.isEmpty())
+-            break; // something is wrong
+-        result.append(s);
+-        str += s.size() + 1;
+-    }
+-    return result;
++
++#ifndef Q_OS_WINRT
++    // old Windows before Vista
++    return QStringList(QString::fromLatin1(winLangCodeToIsoName(GetUserDefaultUILanguage())));
+ #else // !Q_OS_WINRT
+     QStringList result;
+ 

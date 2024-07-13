@@ -1,0 +1,404 @@
+diff --git a/src/plugins/platforms/windows/qwin10helpers.cpp b/src/plugins/platforms/windows/qwin10helpers.cpp
+index 12cccd124b..fa6e1c0f23 100644
+--- a/src/plugins/platforms/windows/qwin10helpers.cpp
++++ b/src/plugins/platforms/windows/qwin10helpers.cpp
+@@ -50,7 +50,7 @@
+ #  define HAS_UI_VIEW_SETTINGS
+ #endif
+ 
+-#include <inspectable.h>
++/*#include <inspectable.h>
+ 
+ #ifdef HAS_UI_VIEW_SETTINGS
+ #  include <windows.ui.viewmanagement.h>
+@@ -91,12 +91,12 @@ public:
+ } // namespace UI
+ } // namespace Windows
+ } // namespace ABI
+-#endif // HAS_UI_VIEW_SETTINGS
++#endif // HAS_UI_VIEW_SETTINGS*/
+ 
+ QT_BEGIN_NAMESPACE
+ 
+ // Starting from Windows 10
+-struct QWindowsComBaseDLL
++/*struct QWindowsComBaseDLL
+ {
+     bool init();
+     bool isValid() const
+@@ -123,14 +123,14 @@ bool QWindowsComBaseDLL::init()
+             reinterpret_cast<WindowsCreateStringReference>(library.resolve("WindowsCreateStringReference"));
+     }
+     return isValid();
+-}
++}*/
+ 
+ // Return tablet mode, note: Does not work for GetDesktopWindow().
+ bool qt_windowsIsTabletMode(HWND hwnd)
+ {
+     bool result = false;
+ 
+-    if (!baseComDll.init())
++/*    if (!baseComDll.init())
+         return false;
+ 
+     const wchar_t uiViewSettingsId[] = L"Windows.UI.ViewManagement.UIViewSettings";
+@@ -161,7 +161,7 @@ bool qt_windowsIsTabletMode(HWND hwnd)
+             result = currentMode == 1; // Touch, 1
+         viewSettings->Release();
+     }
+-    uiViewSettingsInterop->Release();
++    uiViewSettingsInterop->Release();*/
+     return result;
+ }
+ 
+diff --git a/src/plugins/platforms/windows/qwindowsbackingstore.cpp b/src/plugins/platforms/windows/qwindowsbackingstore.cpp
+index 49c7144221..7b4f521564 100644
+--- a/src/plugins/platforms/windows/qwindowsbackingstore.cpp
++++ b/src/plugins/platforms/windows/qwindowsbackingstore.cpp
+@@ -100,15 +100,19 @@ void QWindowsBackingStore::flush(QWindow *window, const QRegion &region,
+         POINT ptDst = {r.x(), r.y()};
+         POINT ptSrc = {0, 0};
+         BLENDFUNCTION blend = {AC_SRC_OVER, 0, BYTE(qRound(255.0 * rw->opacity())), AC_SRC_ALPHA};
+-        RECT dirty = {dirtyRect.x(), dirtyRect.y(),
+-                      dirtyRect.x() + dirtyRect.width(), dirtyRect.y() + dirtyRect.height()};
+-        UPDATELAYEREDWINDOWINFO info = {sizeof(info), NULL, &ptDst, &size, m_image->hdc(), &ptSrc, 0, &blend, ULW_ALPHA, &dirty};
+-        const BOOL result = UpdateLayeredWindowIndirect(rw->handle(), &info);
+-        if (!result)
+-            qErrnoWarning("UpdateLayeredWindowIndirect failed for ptDst=(%d, %d),"
+-                          " size=(%dx%d), dirty=(%dx%d %d, %d)", r.x(), r.y(),
+-                          r.width(), r.height(), dirtyRect.width(), dirtyRect.height(),
+-                          dirtyRect.x(), dirtyRect.y());
++        if (QWindowsContext::user32dll.updateLayeredWindowIndirect) {
++            RECT dirty = {dirtyRect.x(), dirtyRect.y(),
++                dirtyRect.x() + dirtyRect.width(), dirtyRect.y() + dirtyRect.height()};
++            UPDATELAYEREDWINDOWINFO info = {sizeof(info), NULL, &ptDst, &size, m_image->hdc(), &ptSrc, 0, &blend, ULW_ALPHA, &dirty};
++            const BOOL result = QWindowsContext::user32dll.updateLayeredWindowIndirect(rw->handle(), &info);
++            if (!result)
++                qErrnoWarning("UpdateLayeredWindowIndirect failed for ptDst=(%d, %d),"
++                              " size=(%dx%d), dirty=(%dx%d %d, %d)", r.x(), r.y(),
++                              r.width(), r.height(), dirtyRect.width(), dirtyRect.height(),
++                              dirtyRect.x(), dirtyRect.y());
++        } else {
++            QWindowsContext::user32dll.updateLayeredWindow(rw->handle(), NULL, &ptDst, &size, m_image->hdc(), &ptSrc, 0, &blend, ULW_ALPHA);
++        }
+     } else {
+         const HDC dc = rw->getDC();
+         if (!dc) {
+diff --git a/src/plugins/platforms/windows/qwindowscontext.cpp b/src/plugins/platforms/windows/qwindowscontext.cpp
+index 5d444f503d..14be715e8a 100644
+--- a/src/plugins/platforms/windows/qwindowscontext.cpp
++++ b/src/plugins/platforms/windows/qwindowscontext.cpp
+@@ -174,6 +174,13 @@ static bool enableNonClientDpiScaling(HWND hwnd)
+ void QWindowsUser32DLL::init()
+ {
+     QSystemLibrary library(QStringLiteral("user32"));
++    setLayeredWindowAttributes = (SetLayeredWindowAttributes)(library.resolve("SetLayeredWindowAttributes"));
++    updateLayeredWindow = (UpdateLayeredWindow)(library.resolve("UpdateLayeredWindow"));
++    if (!setLayeredWindowAttributes || !updateLayeredWindow)
++        qFatal("This version of Windows is not supported (User32.dll is missing the symbols 'SetLayeredWindowAttributes', 'UpdateLayeredWindow').");
++
++    updateLayeredWindowIndirect = (UpdateLayeredWindowIndirect)(library.resolve("UpdateLayeredWindowIndirect"));
++    isHungAppWindow = (IsHungAppWindow)library.resolve("IsHungAppWindow");
+     setProcessDPIAware = (SetProcessDPIAware)library.resolve("SetProcessDPIAware");
+ 
+     addClipboardFormatListener = (AddClipboardFormatListener)library.resolve("AddClipboardFormatListener");
+@@ -202,6 +209,29 @@ bool QWindowsUser32DLL::initTouch()
+     return isTouchWindow && registerTouchWindow && unregisterTouchWindow && getTouchInputInfo && closeTouchInputHandle;
+ }
+ 
++/*!
++    \class QWindowsShell32DLL
++    \brief Struct that contains dynamically resolved symbols of Shell32.dll.
++
++    The stub libraries shipped with the MinGW compiler miss some of the
++    functions. They need to be retrieved dynamically.
++
++    \sa QWindowsUser32DLL
++
++    \internal
++    \ingroup qt-lighthouse-win
++*/
++
++void QWindowsShell32DLL::init()
++{
++    QSystemLibrary library(QStringLiteral("shell32"));
++    sHCreateItemFromParsingName = (SHCreateItemFromParsingName)(library.resolve("SHCreateItemFromParsingName"));
++    sHGetKnownFolderIDList = (SHGetKnownFolderIDList)(library.resolve("SHGetKnownFolderIDList"));
++    sHGetStockIconInfo = (SHGetStockIconInfo)library.resolve("SHGetStockIconInfo");
++    sHGetImageList = (SHGetImageList)library.resolve("SHGetImageList");
++    sHCreateItemFromIDList = (SHCreateItemFromIDList)library.resolve("SHCreateItemFromIDList");
++}
++
+ void QWindowsShcoreDLL::init()
+ {
+     if (QOperatingSystemVersion::current() < QOperatingSystemVersion::Windows8_1)
+@@ -213,6 +243,7 @@ void QWindowsShcoreDLL::init()
+ }
+ 
+ QWindowsUser32DLL QWindowsContext::user32dll;
++QWindowsShell32DLL QWindowsContext::shell32dll;
+ QWindowsShcoreDLL QWindowsContext::shcoredll;
+ 
+ QWindowsContext *QWindowsContext::m_instance = 0;
+@@ -256,6 +287,7 @@ QWindowsContextPrivate::QWindowsContextPrivate()
+     , m_eventType(QByteArrayLiteral("windows_generic_MSG"))
+ {
+     QWindowsContext::user32dll.init();
++    QWindowsContext::shell32dll.init();
+     QWindowsContext::shcoredll.init();
+ 
+     if (m_mouseHandler.touchDevice() && QWindowsContext::user32dll.initTouch())
+diff --git a/src/plugins/platforms/windows/qwindowscontext.h b/src/plugins/platforms/windows/qwindowscontext.h
+index b50010321b..927a255bf9 100644
+--- a/src/plugins/platforms/windows/qwindowscontext.h
++++ b/src/plugins/platforms/windows/qwindowscontext.h
+@@ -88,6 +88,12 @@ struct QWindowsUser32DLL
+     typedef BOOL (WINAPI *UnregisterTouchWindow)(HWND);
+     typedef BOOL (WINAPI *GetTouchInputInfo)(HANDLE, UINT, PVOID, int);
+     typedef BOOL (WINAPI *CloseTouchInputHandle)(HANDLE);
++    typedef BOOL (WINAPI *SetLayeredWindowAttributes)(HWND, COLORREF, BYTE, DWORD);
++    typedef BOOL (WINAPI *UpdateLayeredWindow)(HWND, HDC , const POINT *,
++                 const SIZE *, HDC, const POINT *, COLORREF,
++                 const BLENDFUNCTION *, DWORD);
++    typedef BOOL (WINAPI *UpdateLayeredWindowIndirect)(HWND, const UPDATELAYEREDWINDOWINFO *);
++    typedef BOOL (WINAPI *IsHungAppWindow)(HWND);
+     typedef BOOL (WINAPI *SetProcessDPIAware)();
+     typedef BOOL (WINAPI *AddClipboardFormatListener)(HWND);
+     typedef BOOL (WINAPI *RemoveClipboardFormatListener)(HWND);
+@@ -97,6 +103,13 @@ struct QWindowsUser32DLL
+     typedef int  (WINAPI *GetWindowDpiAwarenessContext)(HWND);
+     typedef int  (WINAPI *GetAwarenessFromDpiAwarenessContext)(int);
+ 
++    SetLayeredWindowAttributes setLayeredWindowAttributes = nullptr;
++    UpdateLayeredWindow updateLayeredWindow = nullptr;
++
++    // Functions missing in older versions of Windows
++    UpdateLayeredWindowIndirect updateLayeredWindowIndirect = nullptr;
++    IsHungAppWindow isHungAppWindow = nullptr;
++
+     // Touch functions from Windows 7 onwards (also for use with Q_CC_MSVC).
+     IsTouchWindow isTouchWindow = nullptr;
+     RegisterTouchWindow registerTouchWindow = nullptr;
+@@ -121,6 +134,23 @@ struct QWindowsUser32DLL
+     GetAwarenessFromDpiAwarenessContext getAwarenessFromDpiAwarenessContext = nullptr;
+ };
+ 
++struct QWindowsShell32DLL
++{
++    inline void init();
++
++    typedef HRESULT (WINAPI *SHCreateItemFromParsingName)(PCWSTR, IBindCtx *, const GUID&, void **);
++    typedef HRESULT (WINAPI *SHGetKnownFolderIDList)(const GUID &, DWORD, HANDLE, PIDLIST_ABSOLUTE *);
++    typedef HRESULT (WINAPI *SHGetStockIconInfo)(int , int , _SHSTOCKICONINFO *);
++    typedef HRESULT (WINAPI *SHGetImageList)(int, REFIID , void **);
++    typedef HRESULT (WINAPI *SHCreateItemFromIDList)(PCIDLIST_ABSOLUTE, REFIID, void **);
++
++    SHCreateItemFromParsingName sHCreateItemFromParsingName = nullptr;
++    SHGetKnownFolderIDList sHGetKnownFolderIDList = nullptr;
++    SHGetStockIconInfo sHGetStockIconInfo = nullptr;
++    SHGetImageList sHGetImageList = nullptr;
++    SHCreateItemFromIDList sHCreateItemFromIDList = nullptr;
++};
++
+ // Shell scaling library (Windows 8.1 onwards)
+ struct QWindowsShcoreDLL {
+     void init();
+@@ -210,6 +240,7 @@ public:
+     QWindowsTabletSupport *tabletSupport() const;
+ 
+     static QWindowsUser32DLL user32dll;
++    static QWindowsShell32DLL shell32dll;
+     static QWindowsShcoreDLL shcoredll;
+ 
+     static QByteArray comErrorString(HRESULT hr);
+diff --git a/src/plugins/platforms/windows/qwindowsdialoghelpers.cpp b/src/plugins/platforms/windows/qwindowsdialoghelpers.cpp
+index bdae764025..2cdf5caef0 100644
+--- a/src/plugins/platforms/windows/qwindowsdialoghelpers.cpp
++++ b/src/plugins/platforms/windows/qwindowsdialoghelpers.cpp
+@@ -914,18 +914,22 @@ void QWindowsNativeFileDialogBase::setWindowTitle(const QString &title)
+ IShellItem *QWindowsNativeFileDialogBase::shellItem(const QUrl &url)
+ {
+     if (url.isLocalFile()) {
++        if (!QWindowsContext::shell32dll.sHCreateItemFromParsingName)
++            return Q_NULLPTR;
+         IShellItem *result = Q_NULLPTR;
+         const QString native = QDir::toNativeSeparators(url.toLocalFile());
+         const HRESULT hr =
+-                SHCreateItemFromParsingName(reinterpret_cast<const wchar_t *>(native.utf16()),
+-                                            NULL, IID_IShellItem,
+-                                            reinterpret_cast<void **>(&result));
++                QWindowsContext::shell32dll.sHCreateItemFromParsingName(reinterpret_cast<const wchar_t *>(native.utf16()),
++                                                                        NULL, IID_IShellItem,
++                                                                        reinterpret_cast<void **>(&result));
+         if (FAILED(hr)) {
+             qErrnoWarning("%s: SHCreateItemFromParsingName(%s)) failed", __FUNCTION__, qPrintable(url.toString()));
+             return Q_NULLPTR;
+         }
+         return result;
+     } else if (url.scheme() == QLatin1String("clsid")) {
++        if (!QWindowsContext::shell32dll.sHGetKnownFolderIDList || !QWindowsContext::shell32dll.sHCreateItemFromIDList)
++            return Q_NULLPTR;
+         // Support for virtual folders via GUID
+         // (see https://msdn.microsoft.com/en-us/library/windows/desktop/dd378457(v=vs.85).aspx)
+         // specified as "clsid:<GUID>" (without '{', '}').
+@@ -936,12 +940,12 @@ IShellItem *QWindowsNativeFileDialogBase::shellItem(const QUrl &url)
+             return Q_NULLPTR;
+         }
+         PIDLIST_ABSOLUTE idList;
+-        HRESULT hr = SHGetKnownFolderIDList(uuid, 0, 0, &idList);
++        HRESULT hr = QWindowsContext::shell32dll.sHGetKnownFolderIDList(uuid, 0, 0, &idList);
+         if (FAILED(hr)) {
+             qErrnoWarning("%s: SHGetKnownFolderIDList(%s)) failed", __FUNCTION__, qPrintable(url.toString()));
+             return Q_NULLPTR;
+         }
+-        hr = SHCreateItemFromIDList(idList, IID_IShellItem, reinterpret_cast<void **>(&result));
++        hr = QWindowsContext::shell32dll.sHCreateItemFromIDList(idList, IID_IShellItem, reinterpret_cast<void **>(&result));
+         CoTaskMemFree(idList);
+         if (FAILED(hr)) {
+             qErrnoWarning("%s: SHCreateItemFromIDList(%s)) failed", __FUNCTION__, qPrintable(url.toString()));
+diff --git a/src/plugins/platforms/windows/qwindowstheme.cpp b/src/plugins/platforms/windows/qwindowstheme.cpp
+index 7916211219..4c2f696b19 100644
+--- a/src/plugins/platforms/windows/qwindowstheme.cpp
++++ b/src/plugins/platforms/windows/qwindowstheme.cpp
+@@ -686,19 +686,21 @@ QPixmap QWindowsTheme::standardPixmap(StandardPixmap sp, const QSizeF &pixmapSiz
+     default:
+         break;
+     }
+-
++        if (QSysInfo::WindowsVersion >= QSysInfo::WV_VISTA
++            && (QSysInfo::WindowsVersion & QSysInfo::WV_NT_based)) {
+     if (stockId != SIID_INVALID) {
+         QPixmap pixmap;
+         SHSTOCKICONINFO iconInfo;
+         memset(&iconInfo, 0, sizeof(iconInfo));
+         iconInfo.cbSize = sizeof(iconInfo);
+         stockFlags |= (pixmapSize.width() > 16 ? SHGFI_LARGEICON : SHGFI_SMALLICON);
+-        if (SHGetStockIconInfo(stockId, SHGFI_ICON | stockFlags, &iconInfo) == S_OK) {
++        if (QWindowsContext::shell32dll.sHGetStockIconInfo(stockId, SHGFI_ICON | stockFlags, &iconInfo) == S_OK) {
+             pixmap = qt_pixmapFromWinHICON(iconInfo.hIcon);
+             DestroyIcon(iconInfo.hIcon);
+             return pixmap;
+         }
+     }
++}
+ 
+     if (resourceId != -1) {
+         QPixmap pixmap = loadIconFromShell32(resourceId, pixmapSize);
+@@ -773,8 +775,14 @@ static QPixmap pixmapFromShellImageList(int iImageList, const SHFILEINFO &info)
+     // For MinGW:
+     static const IID iID_IImageList = {0x46eb5926, 0x582e, 0x4017, {0x9f, 0xdf, 0xe8, 0x99, 0x8d, 0xaa, 0x9, 0x50}};
+ 
++    if (!QWindowsContext::shell32dll.sHGetImageList)
++        return result;
++    if (iImageList == sHIL_JUMBO && QSysInfo::WindowsVersion < QSysInfo::WV_VISTA)
++        return result;
++
+     IImageList *imageList = 0;
+-    HRESULT hr = SHGetImageList(iImageList, iID_IImageList, reinterpret_cast<void **>(&imageList));
++    HRESULT hr = QWindowsContext::shell32dll.sHGetImageList(iImageList, iID_IImageList,
++                                                            reinterpret_cast<void **>(&imageList));
+     if (hr != S_OK)
+         return result;
+     HICON hIcon;
+diff --git a/src/plugins/platforms/windows/qwindowswindow.cpp b/src/plugins/platforms/windows/qwindowswindow.cpp
+index c1aeecf0ab..fd80fef79f 100644
+--- a/src/plugins/platforms/windows/qwindowswindow.cpp
++++ b/src/plugins/platforms/windows/qwindowswindow.cpp
+@@ -308,27 +308,65 @@ static inline bool windowIsOpenGL(const QWindow *w)
+ 
+ static bool applyBlurBehindWindow(HWND hwnd)
+ {
++#ifdef Q_OS_WINCE
++    Q_UNUSED(hwnd);
++    return false;
++#else
++    enum { dwmBbEnable = 0x1, dwmBbBlurRegion = 0x2 };
++
++    struct DwmBlurBehind {
++        DWORD dwFlags;
++        BOOL  fEnable;
++        HRGN  hRgnBlur;
++        BOOL  fTransitionOnMaximized;
++    };
++
++    typedef HRESULT (WINAPI *PtrDwmEnableBlurBehindWindow)(HWND, const DwmBlurBehind*);
++    typedef HRESULT (WINAPI *PtrDwmIsCompositionEnabled)(BOOL *);
++
++    // DWM API is available only from Windows Vista
++    if (QSysInfo::windowsVersion() < QSysInfo::WV_VISTA)
++        return false;
++
++    static bool functionPointersResolved = false;
++    static PtrDwmEnableBlurBehindWindow dwmBlurBehind = 0;
++    static PtrDwmIsCompositionEnabled dwmIsCompositionEnabled = 0;
++
++    if (Q_UNLIKELY(!functionPointersResolved)) {
++        QSystemLibrary library(QStringLiteral("dwmapi"));
++        if (library.load()) {
++            dwmBlurBehind = (PtrDwmEnableBlurBehindWindow)(library.resolve("DwmEnableBlurBehindWindow"));
++            dwmIsCompositionEnabled = (PtrDwmIsCompositionEnabled)(library.resolve("DwmIsCompositionEnabled"));
++        }
++
++        functionPointersResolved = true;
++    }
++
++    if (Q_UNLIKELY(!dwmBlurBehind || !dwmIsCompositionEnabled))
++        return false;
++
+     BOOL compositionEnabled;
+-    if (DwmIsCompositionEnabled(&compositionEnabled) != S_OK)
++    if (dwmIsCompositionEnabled(&compositionEnabled) != S_OK)
+         return false;
+ 
+-    DWM_BLURBEHIND blurBehind = {0, 0, 0, 0};
++    DwmBlurBehind blurBehind = {0, 0, 0, 0};
+ 
+     if (compositionEnabled) {
+-        blurBehind.dwFlags = DWM_BB_ENABLE | DWM_BB_BLURREGION;
++        blurBehind.dwFlags = dwmBbEnable | dwmBbBlurRegion;
+         blurBehind.fEnable = TRUE;
+         blurBehind.hRgnBlur = CreateRectRgn(0, 0, -1, -1);
+     } else {
+-        blurBehind.dwFlags = DWM_BB_ENABLE;
++        blurBehind.dwFlags = dwmBbEnable;
+         blurBehind.fEnable = FALSE;
+     }
+ 
+-    const bool result = DwmEnableBlurBehindWindow(hwnd, &blurBehind) == S_OK;
++    const bool result = dwmBlurBehind(hwnd, &blurBehind) == S_OK;
+ 
+     if (blurBehind.hRgnBlur)
+         DeleteObject(blurBehind.hRgnBlur);
+ 
+     return result;
++#endif // Q_OS_WINCE
+ }
+ 
+ // from qwidget_win.cpp, pass flags separately in case they have been "autofixed".
+@@ -367,10 +405,10 @@ static void setWindowOpacity(HWND hwnd, Qt::WindowFlags flags, bool hasAlpha, bo
+         const BYTE alpha = BYTE(qRound(255.0 * level));
+         if (hasAlpha && !openGL && (flags & Qt::FramelessWindowHint)) {
+             // Non-GL windows with alpha: Use blend function to update.
+-            BLENDFUNCTION blend = {AC_SRC_OVER, 0, alpha, AC_SRC_ALPHA};
+-            UpdateLayeredWindow(hwnd, NULL, NULL, NULL, NULL, NULL, 0, &blend, ULW_ALPHA);
++            BLENDFUNCTION blend = {AC_SRC_OVER, 0, (BYTE)(255.0 * level), AC_SRC_ALPHA};
++            QWindowsContext::user32dll.updateLayeredWindow(hwnd, NULL, NULL, NULL, NULL, NULL, 0, &blend, ULW_ALPHA);
+         } else {
+-            SetLayeredWindowAttributes(hwnd, 0, alpha, LWA_ALPHA);
++            QWindowsContext::user32dll.setLayeredWindowAttributes(hwnd, 0, (int)(level * 255), LWA_ALPHA);
+         }
+     } else if (IsWindowVisible(hwnd)) { // Repaint when switching from layered.
+         InvalidateRect(hwnd, NULL, TRUE);
+@@ -1635,8 +1673,10 @@ void QWindowsWindow::releaseDC()
+ 
+ static inline bool dwmIsCompositionEnabled()
+ {
+-    BOOL dWmCompositionEnabled = FALSE;
++    /*BOOL dWmCompositionEnabled = FALSE;
+     return SUCCEEDED(DwmIsCompositionEnabled(&dWmCompositionEnabled)) && dWmCompositionEnabled == TRUE;
++    */
++    return false;
+ }
+ 
+ static inline bool isSoftwareGl()

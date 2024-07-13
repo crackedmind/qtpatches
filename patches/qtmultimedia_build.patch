@@ -1,0 +1,13 @@
+diff --git a/src/multimedia/configure.json b/src/multimedia/configure.json
+index e250f2b9a..2e69c0c3d 100644
+--- a/src/multimedia/configure.json
++++ b/src/multimedia/configure.json
+@@ -234,7 +234,7 @@
+         },
+         "gpu_vivante": {
+             "label": "Vivante GPU",
+-            "condition": "features.opengles2 && tests.gpu_vivante",
++            "condition": "!config.win32 && features.opengles2 && tests.gpu_vivante",
+             "output": [ "privateFeature" ]
+         },
+         "resourcepolicy": {

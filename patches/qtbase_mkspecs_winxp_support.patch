@@ -1,0 +1,31 @@
+diff --git a/mkspecs/win32-msvc-xp/qmake.conf b/mkspecs/win32-msvc-xp/qmake.conf
+new file mode 100644
+index 0000000000..fde030045e
+--- /dev/null
++++ b/mkspecs/win32-msvc-xp/qmake.conf
+@@ -0,0 +1,17 @@
++#
++# qmake configuration for win32-msvc-xp
++#
++# Written for Microsoft C/C++ Optimizing Compiler (all desktop versions)
++#
++
++include(../common/msvc-desktop.conf)
++
++QMAKE_CFLAGS           += -D_USING_V110_SDK71_ # -D_WIN32_WINNT=0x0501
++
++QMAKE_CXXFLAGS         += -D_USING_V110_SDK71_ # -D_WIN32_WINNT=0x0501
++
++QMAKE_LFLAGS_WINDOWS   = /SUBSYSTEM:WINDOWS,5.01
++
++QMAKE_LFLAGS_CONSOLE   = /SUBSYSTEM:CONSOLE,5.01
++
++load(qt_config)
+diff --git a/mkspecs/win32-msvc-xp/qplatformdefs.h b/mkspecs/win32-msvc-xp/qplatformdefs.h
+new file mode 100644
+index 0000000000..56e5cf4180
+--- /dev/null
++++ b/mkspecs/win32-msvc-xp/qplatformdefs.h
+@@ -0,0 +1 @@
++#include "../win32-msvc/qplatformdefs.h"
+\ No newline at end of file

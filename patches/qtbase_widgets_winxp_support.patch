@@ -1,0 +1,1387 @@
+diff --git a/src/widgets/dialogs/qwizard_win.cpp b/src/widgets/dialogs/qwizard_win.cpp
+index 666b192e9c..44ecca31a3 100644
+--- a/src/widgets/dialogs/qwizard_win.cpp
++++ b/src/widgets/dialogs/qwizard_win.cpp
+@@ -42,6 +42,7 @@
+ #if QT_CONFIG(style_windowsvista)
+ 
+ #include "qwizard_win_p.h"
++#include <private/qsystemlibrary_p.h>
+ #include <private/qapplication_p.h>
+ #include <qpa/qplatformnativeinterface.h>
+ #include "qwizard.h"
+@@ -60,14 +61,109 @@
+ 
+ Q_DECLARE_METATYPE(QMargins)
+ 
+-#ifndef WM_DWMCOMPOSITIONCHANGED
+-#  define WM_DWMCOMPOSITIONCHANGED 0x031E
+-#endif
+-
+ QT_BEGIN_NAMESPACE
+ 
++//DWM related
++typedef struct  {       //MARGINS
++    int cxLeftWidth;    // width of left border that retains its size
++    int cxRightWidth;   // width of right border that retains its size
++    int cyTopHeight;    // height of top border that retains its size
++    int cyBottomHeight; // height of bottom border that retains its size
++} WIZ_MARGINS;
++typedef struct {        //DTTOPTS
++    DWORD dwSize;
++    DWORD dwFlags;
++    COLORREF crText;
++    COLORREF crBorder;
++    COLORREF crShadow;
++    int eTextShadowType;
++    POINT ptShadowOffset;
++    int iBorderSize;
++    int iFontPropId;
++    int iColorPropId;
++    int iStateId;
++    BOOL fApplyOverlay;
++    int iGlowSize;
++} WIZ_DTTOPTS;
++
++typedef struct {
++    DWORD dwFlags;
++    DWORD dwMask;
++} WIZ_WTA_OPTIONS;
++
++#define WIZ_WM_THEMECHANGED                 0x031A
++#define WIZ_WM_DWMCOMPOSITIONCHANGED        0x031E
++
++enum WIZ_WINDOWTHEMEATTRIBUTETYPE {
++    WIZ_WTA_NONCLIENT = 1
++};
++
++#define WIZ_WTNCA_NODRAWCAPTION 0x00000001
++#define WIZ_WTNCA_NODRAWICON    0x00000002
++
++#define WIZ_DT_CENTER                   0x00000001 //DT_CENTER
++#define WIZ_DT_VCENTER                  0x00000004
++#define WIZ_DT_SINGLELINE               0x00000020
++#define WIZ_DT_NOPREFIX                 0x00000800
++
++enum WIZ_NAVIGATIONPARTS {          //NAVIGATIONPARTS
++    WIZ_NAV_BACKBUTTON = 1,
++    WIZ_NAV_FORWARDBUTTON = 2,
++    WIZ_NAV_MENUBUTTON = 3,
++};
++
++enum WIZ_NAV_BACKBUTTONSTATES {     //NAV_BACKBUTTONSTATES
++    WIZ_NAV_BB_NORMAL = 1,
++    WIZ_NAV_BB_HOT = 2,
++    WIZ_NAV_BB_PRESSED = 3,
++    WIZ_NAV_BB_DISABLED = 4,
++};
++
++#define WIZ_TMT_CAPTIONFONT (801)           //TMT_CAPTIONFONT
++#define WIZ_DTT_COMPOSITED  (1UL << 13)     //DTT_COMPOSITED
++#define WIZ_DTT_GLOWSIZE    (1UL << 11)     //DTT_GLOWSIZE
++
++#define WIZ_WM_NCMOUSELEAVE 674             //WM_NCMOUSELEAVE
++
++#define WIZ_WP_CAPTION             1 //WP_CAPTION
++#define WIZ_CS_ACTIVE              1 //CS_ACTIVE
++#define WIZ_TMT_FILLCOLORHINT   3821 //TMT_FILLCOLORHINT
++#define WIZ_TMT_BORDERCOLORHINT 3822 //TMT_BORDERCOLORHINT
++
++typedef BOOL (WINAPI *PtrDwmDefWindowProc)(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam, LRESULT *plResult);
++typedef HRESULT (WINAPI *PtrDwmIsCompositionEnabled)(BOOL* pfEnabled);
++typedef HRESULT (WINAPI *PtrDwmExtendFrameIntoClientArea)(HWND hWnd, const WIZ_MARGINS* pMarInset);
++typedef HRESULT (WINAPI *PtrSetWindowThemeAttribute)(HWND hwnd, enum WIZ_WINDOWTHEMEATTRIBUTETYPE eAttribute, PVOID pvAttribute, DWORD cbAttribute);
++
++static PtrDwmDefWindowProc pDwmDefWindowProc = 0;
++static PtrDwmIsCompositionEnabled pDwmIsCompositionEnabled = 0;
++static PtrDwmExtendFrameIntoClientArea pDwmExtendFrameIntoClientArea = 0;
++static PtrSetWindowThemeAttribute pSetWindowThemeAttribute = 0;
++
++//Theme related
++typedef bool (WINAPI *PtrIsAppThemed)();
++typedef bool (WINAPI *PtrIsThemeActive)();
++typedef HANDLE (WINAPI *PtrOpenThemeData)(HWND hwnd, LPCWSTR pszClassList);
++typedef HRESULT (WINAPI *PtrCloseThemeData)(HANDLE hTheme);
++typedef HRESULT (WINAPI *PtrGetThemeSysFont)(HANDLE hTheme, int iFontId, LOGFONTW *plf);
++typedef HRESULT (WINAPI *PtrDrawThemeTextEx)(HANDLE hTheme, HDC hdc, int iPartId, int iStateId, LPCWSTR pszText, int cchText, DWORD dwTextFlags, LPRECT pRect, const WIZ_DTTOPTS *pOptions);
++typedef HRESULT (WINAPI *PtrDrawThemeBackground)(HANDLE hTheme, HDC hdc, int iPartId, int iStateId, const RECT *pRect, OPTIONAL const RECT *pClipRect);
++typedef HRESULT (WINAPI *PtrGetThemePartSize)(HANDLE hTheme, HDC hdc, int iPartId, int iStateId, OPTIONAL RECT *prc, enum THEMESIZE eSize, OUT SIZE *psz);
++typedef HRESULT (WINAPI *PtrGetThemeColor)(HANDLE hTheme, int iPartId, int iStateId, int iPropId, OUT COLORREF *pColor);
++
++static PtrIsAppThemed pIsAppThemed = 0;
++static PtrIsThemeActive pIsThemeActive = 0;
++static PtrOpenThemeData pOpenThemeData = 0;
++static PtrCloseThemeData pCloseThemeData = 0;
++static PtrGetThemeSysFont pGetThemeSysFont = 0;
++static PtrDrawThemeTextEx pDrawThemeTextEx = 0;
++static PtrDrawThemeBackground pDrawThemeBackground = 0;
++static PtrGetThemePartSize pGetThemePartSize = 0;
++static PtrGetThemeColor pGetThemeColor = 0;
++
+ int QVistaHelper::instanceCount = 0;
+ int QVistaHelper::m_devicePixelRatio = 1;
++bool QVistaHelper::is_vista = false;
+ QVistaHelper::VistaState QVistaHelper::cachedVistaState = QVistaHelper::Dirty;
+ 
+ /******************************************************************************
+@@ -108,7 +204,7 @@ void QVistaBackButton::paintEvent(QPaintEvent *)
+ {
+     QPainter p(this);
+     QRect r = rect();
+-    const HANDLE theme = OpenThemeData(0, L"Navigation");
++    const HANDLE theme = pOpenThemeData(0, L"Navigation");
+     //RECT rect;
+     QPoint origin;
+     const HDC hdc = QVistaHelper::backingStoreDC(parentWidget(), &origin);
+@@ -125,17 +221,19 @@ void QVistaBackButton::paintEvent(QPaintEvent *)
+     clipRect.left = rDp.left() + xoffsetDp;
+     clipRect.right = rDp.right()  + xoffsetDp;
+ 
+-    int state = NAV_BB_NORMAL;
++    int state = WIZ_NAV_BB_NORMAL;
+     if (!isEnabled())
+-        state = NAV_BB_DISABLED;
++        state = WIZ_NAV_BB_DISABLED;
+     else if (isDown())
+-        state = NAV_BB_PRESSED;
++        state = WIZ_NAV_BB_PRESSED;
+     else if (underMouse())
+-        state = NAV_BB_HOT;
++        state = WIZ_NAV_BB_HOT;
+ 
+-    DrawThemeBackground(theme, hdc,
+-                        layoutDirection() == Qt::LeftToRight ? NAV_BACKBUTTON : NAV_FORWARDBUTTON,
+-                        state, &clipRect, &clipRect);
++    WIZ_NAVIGATIONPARTS buttonType = (layoutDirection() == Qt::LeftToRight
++                                      ? WIZ_NAV_BACKBUTTON
++                                      : WIZ_NAV_FORWARDBUTTON);
++
++    pDrawThemeBackground(theme, hdc, buttonType, state, &clipRect, &clipRect);
+ }
+ 
+ /******************************************************************************
+@@ -149,10 +247,13 @@ QVistaHelper::QVistaHelper(QWizard *wizard)
+     , backButton_(0)
+ {
+     QVistaHelper::m_devicePixelRatio = wizard->devicePixelRatio();
++    is_vista = resolveSymbols();
+     if (instanceCount++ == 0)
+         cachedVistaState = Dirty;
+-    backButton_ = new QVistaBackButton(wizard);
+-    backButton_->hide();
++    if (is_vista) {
++        backButton_ = new QVistaBackButton(wizard);
++        backButton_->hide();
++    }
+ 
+     // Handle diff between Windows 7 and Vista
+     iconSpacing = QStyleHelper::dpiScaled(7);
+@@ -187,13 +288,20 @@ void QVistaHelper::updateCustomMargins(bool vistaMargins)
+ 
+ bool QVistaHelper::isCompositionEnabled()
+ {
+-    BOOL bEnabled;
+-    return SUCCEEDED(DwmIsCompositionEnabled(&bEnabled)) && bEnabled;
++    bool value = is_vista;
++    if (is_vista) {
++        HRESULT hr;
++        BOOL bEnabled;
++
++        hr = pDwmIsCompositionEnabled(&bEnabled);
++        value = (SUCCEEDED(hr) && bEnabled);
++    }
++    return value;
+ }
+ 
+ bool QVistaHelper::isThemeActive()
+ {
+-    return IsThemeActive();
++    return is_vista && pIsThemeActive();
+ }
+ 
+ QVistaHelper::VistaState QVistaHelper::vistaState()
+@@ -213,9 +321,9 @@ void QVistaHelper::disconnectBackButton()
+ QColor QVistaHelper::basicWindowFrameColor()
+ {
+     DWORD rgb;
+-    const HANDLE hTheme = OpenThemeData(GetDesktopWindow(), L"WINDOW");
+-    GetThemeColor(hTheme, WP_CAPTION, CS_ACTIVE,
+-                  wizard->isActiveWindow() ? TMT_FILLCOLORHINT : TMT_BORDERCOLORHINT, &rgb);
++    const HANDLE hTheme = pOpenThemeData(GetDesktopWindow(), L"WINDOW");
++    pGetThemeColor(hTheme, WIZ_WP_CAPTION, WIZ_CS_ACTIVE,
++                  wizard->isActiveWindow() ? WIZ_TMT_FILLCOLORHINT : WIZ_TMT_BORDERCOLORHINT, &rgb);
+     BYTE r = GetRValue(rgb);
+     BYTE g = GetGValue(rgb);
+     BYTE b = GetBValue(rgb);
+@@ -226,13 +334,13 @@ bool QVistaHelper::setDWMTitleBar(TitleBarChangeType type)
+ {
+     bool value = false;
+     if (vistaState() == VistaAero) {
+-        MARGINS mar = {0, 0, 0, 0};
++        WIZ_MARGINS mar = {0, 0, 0, 0};
+         if (type == NormalTitleBar)
+             mar.cyTopHeight = 0;
+         else
+             mar.cyTopHeight = (titleBarSize() + topOffset()) * QVistaHelper::m_devicePixelRatio;
+         if (const HWND wizardHandle = wizardHWND())
+-            if (SUCCEEDED(DwmExtendFrameIntoClientArea(wizardHandle, &mar)))
++            if (SUCCEEDED(pDwmExtendFrameIntoClientArea(wizardHandle, &mar)))
+                 value = true;
+     }
+     return value;
+@@ -244,7 +352,7 @@ static LOGFONT getCaptionLogFont(HANDLE hTheme)
+ {
+     LOGFONT result = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, { 0 } };
+ 
+-    if (!hTheme || FAILED(GetThemeSysFont(hTheme, TMT_CAPTIONFONT, &result))) {
++    if (!hTheme || FAILED(pGetThemeSysFont(hTheme, WIZ_TMT_CAPTIONFONT, &result))) {
+         NONCLIENTMETRICS ncm;
+         ncm.cbSize = sizeof(NONCLIENTMETRICS);
+         SystemParametersInfo(SPI_GETNONCLIENTMETRICS, sizeof(NONCLIENTMETRICS), &ncm, false);
+@@ -255,7 +363,10 @@ static LOGFONT getCaptionLogFont(HANDLE hTheme)
+ 
+ static bool getCaptionQFont(int dpi, QFont *result)
+ {
+-    const HANDLE hTheme = OpenThemeData(GetDesktopWindow(), L"WINDOW");
++    if (!pOpenThemeData)
++        return false;
++    const HANDLE hTheme =
++        pOpenThemeData(QApplicationPrivate::getHWNDForWidget(QApplication::desktop()), L"WINDOW");
+     if (!hTheme)
+         return false;
+     // Call into QWindowsNativeInterface to convert the LOGFONT into a QFont.
+@@ -330,14 +441,16 @@ void QVistaHelper::drawTitleBar(QPainter *painter)
+ 
+ void QVistaHelper::setTitleBarIconAndCaptionVisible(bool visible)
+ {
+-    WTA_OPTIONS opt;
+-    opt.dwFlags = WTNCA_NODRAWICON | WTNCA_NODRAWCAPTION;
+-    if (visible)
+-        opt.dwMask = 0;
+-    else
+-        opt.dwMask = WTNCA_NODRAWICON | WTNCA_NODRAWCAPTION;
+-    if (const HWND handle = wizardHWND())
+-        SetWindowThemeAttribute(handle, WTA_NONCLIENT, &opt, sizeof(WTA_OPTIONS));
++    if (is_vista) {
++        WIZ_WTA_OPTIONS opt;
++        opt.dwFlags = WIZ_WTNCA_NODRAWICON | WIZ_WTNCA_NODRAWCAPTION;
++        if (visible)
++            opt.dwMask = 0;
++        else
++            opt.dwMask = WIZ_WTNCA_NODRAWICON | WIZ_WTNCA_NODRAWCAPTION;
++        if (const HWND handle = wizardHWND())
++            pSetWindowThemeAttribute(handle, WIZ_WTA_NONCLIENT, &opt, sizeof(WIZ_WTA_OPTIONS));
++    }
+ }
+ 
+ bool QVistaHelper::winEvent(MSG* msg, long* result)
+@@ -346,7 +459,7 @@ bool QVistaHelper::winEvent(MSG* msg, long* result)
+     case WM_NCHITTEST: {
+         LRESULT lResult;
+         // Perform hit testing using DWM
+-        if (DwmDefWindowProc(msg->hwnd, msg->message, msg->wParam, msg->lParam, &lResult)) {
++        if (pDwmDefWindowProc(msg->hwnd, msg->message, msg->wParam, msg->lParam, &lResult)) {
+             // DWM returned a hit, no further processing necessary
+             *result = lResult;
+         } else {
+@@ -365,7 +478,7 @@ bool QVistaHelper::winEvent(MSG* msg, long* result)
+     default:
+         LRESULT lResult;
+         // Pass to DWM to handle
+-        if (DwmDefWindowProc(msg->hwnd, msg->message, msg->wParam, msg->lParam, &lResult))
++        if (pDwmDefWindowProc(msg->hwnd, msg->message, msg->wParam, msg->lParam, &lResult))
+             *result = lResult;
+         // If the message wasn't handled by DWM, continue processing it as normal
+         else
+@@ -404,7 +517,7 @@ void QVistaHelper::mouseEvent(QEvent *event)
+ 
+ bool QVistaHelper::handleWinEvent(MSG *message, long *result)
+ {
+-    if (message->message == WM_THEMECHANGED || message->message == WM_DWMCOMPOSITIONCHANGED)
++    if (message->message == WIZ_WM_THEMECHANGED || message->message == WIZ_WM_DWMCOMPOSITIONCHANGED)
+         cachedVistaState = Dirty;
+ 
+     bool status = false;
+@@ -586,7 +699,7 @@ bool QVistaHelper::drawTitleText(QPainter *painter, const QString &text, const Q
+     if (vistaState() == VistaAero) {
+         const QRect rectDp = QRect(rect.topLeft() * QVistaHelper::m_devicePixelRatio,
+                                    rect.size() * QVistaHelper::m_devicePixelRatio);
+-        const HANDLE hTheme = OpenThemeData(GetDesktopWindow(), L"WINDOW");
++        const HANDLE hTheme = pOpenThemeData(GetDesktopWindow(), L"WINDOW");
+         if (!hTheme) return false;
+         // Set up a memory DC and bitmap that we'll draw into
+         HDC dcMem;
+@@ -611,16 +724,16 @@ bool QVistaHelper::drawTitleText(QPainter *painter, const QString &text, const Q
+         HFONT hOldFont = (HFONT)SelectObject(dcMem, (HGDIOBJ) hCaptionFont);
+ 
+         // Draw the text!
+-        DTTOPTS dto;
++        WIZ_DTTOPTS dto;
+         memset(&dto, 0, sizeof(dto));
+         dto.dwSize = sizeof(dto);
+-        const UINT uFormat = DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_NOPREFIX;
++        const UINT uFormat = WIZ_DT_SINGLELINE|WIZ_DT_CENTER|WIZ_DT_VCENTER|WIZ_DT_NOPREFIX;
+         RECT rctext ={0,0, rectDp.width(), rectDp.height()};
+ 
+-        dto.dwFlags = DTT_COMPOSITED|DTT_GLOWSIZE;
++        dto.dwFlags = WIZ_DTT_COMPOSITED|WIZ_DTT_GLOWSIZE;
+         dto.iGlowSize = glowSize();
+ 
+-        DrawThemeTextEx(hTheme, dcMem, 0, 0, reinterpret_cast<LPCWSTR>(text.utf16()), -1, uFormat, &rctext, &dto );
++        pDrawThemeTextEx(hTheme, dcMem, 0, 0, reinterpret_cast<LPCWSTR>(text.utf16()), -1, uFormat, &rctext, &dto );
+         BitBlt(hdc, rectDp.left(), rectDp.top(), rectDp.width(), rectDp.height(), dcMem, 0, 0, SRCCOPY);
+         SelectObject(dcMem, (HGDIOBJ) hOldBmp);
+         SelectObject(dcMem, (HGDIOBJ) hOldFont);
+@@ -693,6 +806,51 @@ int QVistaHelper::captionSizeDp()
+     return GetSystemMetrics(SM_CYCAPTION);
+ }
+ 
++bool QVistaHelper::resolveSymbols()
++{
++    static bool tried = false;
++    if (!tried) {
++        tried = true;
++        QSystemLibrary dwmLib(L"dwmapi");
++        pDwmIsCompositionEnabled =
++            (PtrDwmIsCompositionEnabled)dwmLib.resolve("DwmIsCompositionEnabled");
++        if (pDwmIsCompositionEnabled) {
++            pDwmDefWindowProc = (PtrDwmDefWindowProc)dwmLib.resolve("DwmDefWindowProc");
++            pDwmExtendFrameIntoClientArea =
++                (PtrDwmExtendFrameIntoClientArea)dwmLib.resolve("DwmExtendFrameIntoClientArea");
++        }
++        QSystemLibrary themeLib(L"uxtheme");
++        pIsAppThemed = (PtrIsAppThemed)themeLib.resolve("IsAppThemed");
++        if (pIsAppThemed) {
++            pDrawThemeBackground = (PtrDrawThemeBackground)themeLib.resolve("DrawThemeBackground");
++            pGetThemePartSize = (PtrGetThemePartSize)themeLib.resolve("GetThemePartSize");
++            pGetThemeColor = (PtrGetThemeColor)themeLib.resolve("GetThemeColor");
++            pIsThemeActive = (PtrIsThemeActive)themeLib.resolve("IsThemeActive");
++            pOpenThemeData = (PtrOpenThemeData)themeLib.resolve("OpenThemeData");
++            pCloseThemeData = (PtrCloseThemeData)themeLib.resolve("CloseThemeData");
++            pGetThemeSysFont = (PtrGetThemeSysFont)themeLib.resolve("GetThemeSysFont");
++            pDrawThemeTextEx = (PtrDrawThemeTextEx)themeLib.resolve("DrawThemeTextEx");
++            pSetWindowThemeAttribute = (PtrSetWindowThemeAttribute)themeLib.resolve("SetWindowThemeAttribute");
++        }
++    }
++
++    return (
++        pDwmIsCompositionEnabled != 0
++        && pDwmDefWindowProc != 0
++        && pDwmExtendFrameIntoClientArea != 0
++        && pIsAppThemed != 0
++        && pDrawThemeBackground != 0
++        && pGetThemePartSize != 0
++        && pGetThemeColor != 0
++        && pIsThemeActive != 0
++        && pOpenThemeData != 0
++        && pCloseThemeData != 0
++        && pGetThemeSysFont != 0
++        && pDrawThemeTextEx != 0
++        && pSetWindowThemeAttribute != 0
++        );
++}
++
+ int QVistaHelper::titleOffset()
+ {
+     int iconOffset = wizard ->windowIcon().isNull() ? 0 : iconSize() + textSpacing;
+@@ -714,7 +872,7 @@ int QVistaHelper::topOffset()
+     if (vistaState() != VistaAero)
+         return titleBarSize() + 3;
+     static const int aeroOffset =
+-        QOperatingSystemVersion::current() < QOperatingSystemVersion::Windows8 ?
++        QSysInfo::WindowsVersion == QSysInfo::WV_WINDOWS7 ?
+         QStyleHelper::dpiScaled(4) : QStyleHelper::dpiScaled(13);
+     return aeroOffset + titleBarSize();
+ }
+diff --git a/src/widgets/dialogs/qwizard_win_p.h b/src/widgets/dialogs/qwizard_win_p.h
+index f9122865c2..e640dcd8d2 100644
+--- a/src/widgets/dialogs/qwizard_win_p.h
++++ b/src/widgets/dialogs/qwizard_win_p.h
+@@ -127,6 +127,7 @@ private:
+     int leftMargin() { return backButton_->isVisible() ? backButtonSize() + iconSpacing : 0; }
+ 
+     int titleOffset();
++    bool resolveSymbols();
+     void drawTitleBar(QPainter *painter);
+     void setMouseCursor(QPoint pos);
+     void collapseTopFrameStrut();
+@@ -137,6 +138,7 @@ private:
+     bool eventFilter(QObject *obj, QEvent *event);
+ 
+     static int instanceCount;
++    static bool is_vista;
+     static VistaState cachedVistaState;
+     static bool isCompositionEnabled();
+     static bool isThemeActive();
+diff --git a/src/widgets/styles/qwindowsvistastyle.cpp b/src/widgets/styles/qwindowsvistastyle.cpp
+index 88eb0c6e79..33cac1e3f4 100644
+--- a/src/widgets/styles/qwindowsvistastyle.cpp
++++ b/src/widgets/styles/qwindowsvistastyle.cpp
+@@ -88,7 +88,8 @@ bool QWindowsVistaStylePrivate::useVista()
+ {
+     return (QSysInfo::WindowsVersion >= QSysInfo::WV_VISTA
+             && (QSysInfo::WindowsVersion & QSysInfo::WV_NT_based))
+-           && QWindowsVistaStylePrivate::useXP();
++           && QWindowsVistaStylePrivate::useXP()
++           && QWindowsVistaStylePrivate::pGetThemeTransitionDuration != Q_NULLPTR;
+ }
+ 
+ /* \internal
+@@ -361,7 +362,7 @@ void QWindowsVistaStyle::drawPrimitive(PrimitiveElement element, const QStyleOpt
+ 
+                     //translate state flags to UXTHEME states :
+                     if (element == PE_FrameLineEdit) {
+-                        theme = OpenThemeData(0, L"Edit");
++                        theme = QWindowsXPStylePrivate::pOpenThemeData(0, L"Edit");
+                         partId = EP_EDITBORDER_NOSCROLL;
+ 
+                         if (oldState & State_MouseOver)
+@@ -392,9 +393,9 @@ void QWindowsVistaStyle::drawPrimitive(PrimitiveElement element, const QStyleOpt
+                     }
+ 
+                     // Retrieve the transition time between the states from the system.
+-                    if (theme
+-                        && SUCCEEDED(GetThemeTransitionDuration(theme, partId, fromState, toState,
+-                                                                TMT_TRANSITIONDURATIONS, &duration))) {
++                    if (theme && QWindowsXPStylePrivate::pGetThemeTransitionDuration(theme, partId, fromState, toState,
++                                                             TMT_TRANSITIONDURATIONS, &duration) == S_OK)
++                    {
+                         t->setDuration(duration);
+                     }
+                     t->setStartTime(QTime::currentTime());
+@@ -512,7 +513,7 @@ void QWindowsVistaStyle::drawPrimitive(PrimitiveElement element, const QStyleOpt
+                               EP_EDITBORDER_HVSCROLL, stateId, option->rect);
+             // Since EP_EDITBORDER_HVSCROLL does not us borderfill, theme.noContent cannot be used for clipping
+             int borderSize = 1;
+-            GetThemeInt(theme.handle(), theme.partId, theme.stateId, TMT_BORDERSIZE, &borderSize);
++            QWindowsXPStylePrivate::pGetThemeInt(theme.handle(), theme.partId, theme.stateId, TMT_BORDERSIZE, &borderSize);
+             QRegion clipRegion = option->rect;
+             QRegion content = option->rect.adjusted(borderSize, borderSize, -borderSize, -borderSize);
+             clipRegion ^= content;
+@@ -547,18 +548,22 @@ void QWindowsVistaStyle::drawPrimitive(PrimitiveElement element, const QStyleOpt
+                     return;
+                 }
+                 int bgType;
+-                GetThemeEnumValue(theme.handle(), partId, stateId, TMT_BGTYPE, &bgType);
++                QWindowsXPStylePrivate::pGetThemeEnumValue( theme.handle(),
++                                    partId,
++                                    stateId,
++                                    TMT_BGTYPE,
++                                    &bgType);
+                 if( bgType == BT_IMAGEFILE ) {
+                     d->drawBackground(theme);
+                 } else {
+                     QBrush fillColor = option->palette.brush(QPalette::Base);
+                     if (!isEnabled) {
+                         PROPERTYORIGIN origin = PO_NOTFOUND;
+-                        GetThemePropertyOrigin(theme.handle(), theme.partId, theme.stateId, TMT_FILLCOLOR, &origin);
++                        QWindowsXPStylePrivate::pGetThemePropertyOrigin(theme.handle(), theme.partId, theme.stateId, TMT_FILLCOLOR, &origin);
+                         // Use only if the fill property comes from our part
+                         if ((origin == PO_PART || origin == PO_STATE)) {
+                             COLORREF bgRef;
+-                            GetThemeColor(theme.handle(), partId, stateId, TMT_FILLCOLOR, &bgRef);
++                            QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), partId, stateId, TMT_FILLCOLOR, &bgRef);
+                             fillColor = QBrush(qRgb(GetRValue(bgRef), GetGValue(bgRef), GetBValue(bgRef)));
+                         }
+                     }
+@@ -898,11 +903,11 @@ void QWindowsVistaStyle::drawControl(ControlElement element, const QStyleOption
+ 
+ 
+                 DWORD duration = 0;
+-                const HTHEME theme = OpenThemeData(0, L"Button");
++                const HTHEME theme = QWindowsXPStylePrivate::pOpenThemeData(0, L"Button");
+ 
+                 int fromState = buttonStateId(oldState, BP_PUSHBUTTON);
+                 int toState = buttonStateId(option->state, BP_PUSHBUTTON);
+-                if (GetThemeTransitionDuration(theme, BP_PUSHBUTTON, fromState, toState, TMT_TRANSITIONDURATIONS, &duration) == S_OK)
++                if (QWindowsXPStylePrivate::pGetThemeTransitionDuration(theme, BP_PUSHBUTTON, fromState, toState, TMT_TRANSITIONDURATIONS, &duration) == S_OK)
+                     t->setDuration(duration);
+                 else
+                     t->setDuration(0);
+@@ -1454,7 +1459,7 @@ void QWindowsVistaStyle::drawControl(ControlElement element, const QStyleOption
+                 // We cannot currently get the correct selection color for "explorer style" views
+                 COLORREF cref = 0;
+                 XPThemeData theme(d->treeViewHelper(), 0, QLatin1String("LISTVIEW"), 0, 0);
+-                unsigned int res = GetThemeColor(theme.handle(), LVP_LISTITEM, LISS_SELECTED, TMT_TEXTCOLOR, &cref);
++                unsigned int res = [GetThemeColor(theme.handle(), LVP_LISTITEM, LISS_SELECTED, TMT_TEXTCOLOR, &cref);
+                 QColor textColor(GetRValue(cref), GetGValue(cref), GetBValue(cref));
+                 */
+                 QPalette palette = vopt->palette;
+@@ -1922,7 +1927,7 @@ QRect QWindowsVistaStyle::subElementRect(SubElement element, const QStyleOption
+     case SE_PushButtonContents:
+         if (const QStyleOptionButton *btn = qstyleoption_cast<const QStyleOptionButton *>(option)) {
+             MARGINS borderSize;
+-            const HTHEME theme = OpenThemeData(widget ? QWindowsVistaStylePrivate::winId(widget) : 0, L"Button");
++            const HTHEME theme = QWindowsXPStylePrivate::pOpenThemeData(widget ? QWindowsVistaStylePrivate::winId(widget) : 0, L"Button");
+             if (theme) {
+                 int stateId = PBS_NORMAL;
+                 if (!(option->state & State_Enabled))
+@@ -1937,7 +1942,7 @@ QRect QWindowsVistaStyle::subElementRect(SubElement element, const QStyleOption
+                 int border = proxy()->pixelMetric(PM_DefaultFrameWidth, btn, widget);
+                 rect = option->rect.adjusted(border, border, -border, -border);
+ 
+-                if (SUCCEEDED(GetThemeMargins(theme, NULL, BP_PUSHBUTTON, stateId, TMT_CONTENTMARGINS, NULL, &borderSize))) {
++                if (SUCCEEDED(QWindowsXPStylePrivate::pGetThemeMargins(theme, NULL, BP_PUSHBUTTON, stateId, TMT_CONTENTMARGINS, NULL, &borderSize))) {
+                     rect.adjust(borderSize.cxLeftWidth, borderSize.cyTopHeight,
+                                 -borderSize.cxRightWidth, -borderSize.cyBottomHeight);
+                     rect = visualRect(option->direction, option->rect, rect);
+@@ -2309,8 +2314,8 @@ void QWindowsVistaStyle::polish(QWidget *widget)
+         //we do not have to care about unpolishing
+         widget->setContentsMargins(3, 0, 4, 0);
+         COLORREF bgRef;
+-        HTHEME theme = OpenThemeData(widget ? QWindowsVistaStylePrivate::winId(widget) : 0, L"TOOLTIP");
+-        if (theme && SUCCEEDED(GetThemeColor(theme, TTP_STANDARD, TTSS_NORMAL, TMT_TEXTCOLOR, &bgRef))) {
++        HTHEME theme = QWindowsXPStylePrivate::pOpenThemeData(widget ? QWindowsVistaStylePrivate::winId(widget) : 0, L"TOOLTIP");
++        if (theme && SUCCEEDED(QWindowsXPStylePrivate::pGetThemeColor(theme, TTP_STANDARD, TTSS_NORMAL, TMT_TEXTCOLOR, &bgRef))) {
+             QColor textColor = QColor::fromRgb(bgRef);
+             QPalette pal;
+             pal.setColor(QPalette::All, QPalette::ToolTipText, textColor);
+diff --git a/src/widgets/styles/qwindowsxpstyle.cpp b/src/widgets/styles/qwindowsxpstyle.cpp
+index 603bceff68..5bba6e454c 100644
+--- a/src/widgets/styles/qwindowsxpstyle.cpp
++++ b/src/widgets/styles/qwindowsxpstyle.cpp
+@@ -47,6 +47,7 @@
+ #include <qpa/qplatformnativeinterface.h>
+ #include <private/qstylehelper_p.h>
+ #include <private/qwidget_p.h>
++#include <private/qsystemlibrary_p.h>
+ #include <qpainter.h>
+ #include <qpaintengine.h>
+ #include <qwidget.h>
+@@ -91,6 +92,78 @@
+ 
+ QT_BEGIN_NAMESPACE
+ 
++// Runtime resolved theme engine function calls
++
++QWindowsUxThemeLib::PtrIsAppThemed QWindowsUxThemeLib::pIsAppThemed = Q_NULLPTR;
++QWindowsUxThemeLib::PtrIsThemeActive QWindowsUxThemeLib::pIsThemeActive = Q_NULLPTR;
++QWindowsUxThemeLib::PtrOpenThemeData QWindowsUxThemeLib::pOpenThemeData = Q_NULLPTR;
++QWindowsUxThemeLib::PtrCloseThemeData QWindowsUxThemeLib::pCloseThemeData = Q_NULLPTR;
++QWindowsUxThemeLib::PtrDrawThemeBackground QWindowsUxThemeLib::pDrawThemeBackground = Q_NULLPTR;
++QWindowsUxThemeLib::PtrDrawThemeBackgroundEx QWindowsUxThemeLib::pDrawThemeBackgroundEx = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetCurrentThemeName QWindowsUxThemeLib::pGetCurrentThemeName = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeBool QWindowsUxThemeLib::pGetThemeBool = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeColor QWindowsUxThemeLib::pGetThemeColor = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeEnumValue QWindowsUxThemeLib::pGetThemeEnumValue = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeFilename QWindowsUxThemeLib::pGetThemeFilename = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeFont QWindowsUxThemeLib::pGetThemeFont = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeInt QWindowsUxThemeLib::pGetThemeInt = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeIntList QWindowsUxThemeLib::pGetThemeIntList = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeMargins QWindowsUxThemeLib::pGetThemeMargins = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeMetric QWindowsUxThemeLib::pGetThemeMetric = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemePartSize QWindowsUxThemeLib::pGetThemePartSize = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemePosition QWindowsUxThemeLib::pGetThemePosition = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemePropertyOrigin QWindowsUxThemeLib::pGetThemePropertyOrigin = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeRect QWindowsUxThemeLib::pGetThemeRect = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeString QWindowsUxThemeLib::pGetThemeString = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeBackgroundRegion QWindowsUxThemeLib::pGetThemeBackgroundRegion = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeDocumentationProperty QWindowsUxThemeLib::pGetThemeDocumentationProperty = Q_NULLPTR;
++QWindowsUxThemeLib::PtrIsThemeBackgroundPartiallyTransparent
++    QWindowsUxThemeLib::pIsThemeBackgroundPartiallyTransparent = Q_NULLPTR;
++QWindowsUxThemeLib::PtrSetWindowTheme QWindowsUxThemeLib::pSetWindowTheme = Q_NULLPTR;
++QWindowsUxThemeLib::PtrGetThemeTransitionDuration QWindowsUxThemeLib::pGetThemeTransitionDuration = Q_NULLPTR;
++
++bool QWindowsUxThemeLib::resolveSymbols()
++{
++    static bool tried = false;
++    if (tried)
++        return pIsAppThemed != Q_NULLPTR;
++    tried = true;
++    QSystemLibrary themeLib(QLatin1String("uxtheme"));
++    if (!themeLib.load())
++        return false;
++    pIsAppThemed = (PtrIsAppThemed)themeLib.resolve("IsAppThemed");
++    if (!pIsAppThemed)
++        return false;
++    pIsThemeActive          = (PtrIsThemeActive         )themeLib.resolve("IsThemeActive");
++    pGetThemePartSize       = (PtrGetThemePartSize      )themeLib.resolve("GetThemePartSize");
++    pOpenThemeData          = (PtrOpenThemeData         )themeLib.resolve("OpenThemeData");
++    pCloseThemeData         = (PtrCloseThemeData        )themeLib.resolve("CloseThemeData");
++    pDrawThemeBackground    = (PtrDrawThemeBackground   )themeLib.resolve("DrawThemeBackground");
++    pDrawThemeBackgroundEx  = (PtrDrawThemeBackgroundEx )themeLib.resolve("DrawThemeBackgroundEx");
++    pGetCurrentThemeName    = (PtrGetCurrentThemeName   )themeLib.resolve("GetCurrentThemeName");
++    pGetThemeBool           = (PtrGetThemeBool          )themeLib.resolve("GetThemeBool");
++    pGetThemeColor          = (PtrGetThemeColor         )themeLib.resolve("GetThemeColor");
++    pGetThemeEnumValue      = (PtrGetThemeEnumValue     )themeLib.resolve("GetThemeEnumValue");
++    pGetThemeFilename       = (PtrGetThemeFilename      )themeLib.resolve("GetThemeFilename");
++    pGetThemeFont           = (PtrGetThemeFont          )themeLib.resolve("GetThemeFont");
++    pGetThemeInt            = (PtrGetThemeInt           )themeLib.resolve("GetThemeInt");
++    pGetThemeIntList        = (PtrGetThemeIntList       )themeLib.resolve("GetThemeIntList");
++    pGetThemeMargins        = (PtrGetThemeMargins       )themeLib.resolve("GetThemeMargins");
++    pGetThemeMetric         = (PtrGetThemeMetric        )themeLib.resolve("GetThemeMetric");
++    pGetThemePartSize       = (PtrGetThemePartSize      )themeLib.resolve("GetThemePartSize");
++    pGetThemePosition       = (PtrGetThemePosition      )themeLib.resolve("GetThemePosition");
++    pGetThemePropertyOrigin = (PtrGetThemePropertyOrigin)themeLib.resolve("GetThemePropertyOrigin");
++    pGetThemeRect           = (PtrGetThemeRect          )themeLib.resolve("GetThemeRect");
++    pGetThemeString         = (PtrGetThemeString        )themeLib.resolve("GetThemeString");
++    pGetThemeBackgroundRegion              = (PtrGetThemeBackgroundRegion             )themeLib.resolve("GetThemeBackgroundRegion");
++    pGetThemeDocumentationProperty         = (PtrGetThemeDocumentationProperty        )themeLib.resolve("GetThemeDocumentationProperty");
++    pIsThemeBackgroundPartiallyTransparent = (PtrIsThemeBackgroundPartiallyTransparent)themeLib.resolve("IsThemeBackgroundPartiallyTransparent");
++    pSetWindowTheme         = (PtrSetWindowTheme        )themeLib.resolve("SetWindowTheme");
++    if (QSysInfo::windowsVersion() >= QSysInfo::WV_VISTA)
++        pGetThemeTransitionDuration = (PtrGetThemeTransitionDuration)themeLib.resolve("GetThemeTransitionDuration");
++     return true;
++}
++
+ // General const values
+ static const int windowsItemFrame        =  2; // menu item frame width
+ static const int windowsItemHMargin      =  3; // menu item hor text margin
+@@ -174,7 +247,7 @@ RECT XPThemeData::toRECT(const QRect &qr)
+ */
+ HRGN XPThemeData::mask(QWidget *widget)
+ {
+-    if (!IsThemeBackgroundPartiallyTransparent(handle(), partId, stateId))
++    if (!QWindowsXPStylePrivate::pIsThemeBackgroundPartiallyTransparent(handle(), partId, stateId))
+         return 0;
+ 
+     HRGN hrgn;
+@@ -182,7 +255,7 @@ HRGN XPThemeData::mask(QWidget *widget)
+     if (widget)
+         dc = hdcForWidgetBackingStore(widget);
+     RECT nativeRect = toRECT(rect);
+-    GetThemeBackgroundRegion(handle(), dc, partId, stateId, &nativeRect, &hrgn);
++    QWindowsXPStylePrivate::pGetThemeBackgroundRegion(handle(), dc, partId, stateId, &nativeRect, &hrgn);
+     return hrgn;
+ }
+ 
+@@ -228,7 +301,8 @@ bool QWindowsXPStylePrivate::useXP(bool update)
+ {
+     if (!update)
+         return use_xp;
+-    return use_xp = IsThemeActive() && (IsAppThemed() || !QApplication::instance());
++    return (use_xp = QWindowsUxThemeLib::resolveSymbols() && pIsThemeActive()
++            && (pIsAppThemed() || !QApplication::instance()));
+ }
+ 
+ /* \internal
+@@ -308,7 +382,7 @@ bool QWindowsXPStylePrivate::initVistaTreeViewTheming()
+         qWarning("Unable to create the treeview helper window.");
+         return false;
+     }
+-    if (FAILED(SetWindowTheme(m_vistaTreeViewHelper, L"explorer", NULL))) {
++    if (FAILED(QWindowsXPStylePrivate::pSetWindowTheme(m_vistaTreeViewHelper, L"explorer", NULL))) {
+         qErrnoWarning("SetWindowTheme() failed.");
+         cleanupVistaTreeViewTheming();
+         return false;
+@@ -349,7 +423,7 @@ HTHEME QWindowsXPStylePrivate::createTheme(int theme, HWND hwnd)
+         const wchar_t *name = themeNames[theme];
+         if (theme == VistaTreeViewTheme && QWindowsXPStylePrivate::initVistaTreeViewTheming())
+             hwnd = QWindowsXPStylePrivate::m_vistaTreeViewHelper;
+-        m_themes[theme] = OpenThemeData(hwnd, name);
++        m_themes[theme] = pOpenThemeData(hwnd, name);
+         if (Q_UNLIKELY(!m_themes[theme]))
+             qErrnoWarning("OpenThemeData() failed for theme %d (%s).",
+                           theme, qPrintable(themeName(theme)));
+@@ -440,6 +514,48 @@ const QPixmap *QWindowsXPStylePrivate::tabBody(QWidget *widget)
+     return tabbody;
+ }
+ 
++/*! \internal
++    Returns \c true if all the necessary theme engine symbols were
++    resolved.
++*/
++bool QWindowsXPStylePrivate::resolveSymbols()
++{
++    static bool tried = false;
++    if (!tried) {
++        tried = true;
++        QSystemLibrary themeLib(QLatin1String("uxtheme"));
++        pIsAppThemed = (PtrIsAppThemed)themeLib.resolve("IsAppThemed");
++        if (pIsAppThemed) {
++            pIsThemeActive          = (PtrIsThemeActive         )themeLib.resolve("IsThemeActive");
++            pGetThemePartSize       = (PtrGetThemePartSize      )themeLib.resolve("GetThemePartSize");
++            pOpenThemeData          = (PtrOpenThemeData         )themeLib.resolve("OpenThemeData");
++            pCloseThemeData         = (PtrCloseThemeData        )themeLib.resolve("CloseThemeData");
++            pDrawThemeBackground    = (PtrDrawThemeBackground   )themeLib.resolve("DrawThemeBackground");
++            pDrawThemeBackgroundEx  = (PtrDrawThemeBackgroundEx )themeLib.resolve("DrawThemeBackgroundEx");
++            pGetCurrentThemeName    = (PtrGetCurrentThemeName   )themeLib.resolve("GetCurrentThemeName");
++            pGetThemeBool           = (PtrGetThemeBool          )themeLib.resolve("GetThemeBool");
++            pGetThemeColor          = (PtrGetThemeColor         )themeLib.resolve("GetThemeColor");
++            pGetThemeEnumValue      = (PtrGetThemeEnumValue     )themeLib.resolve("GetThemeEnumValue");
++            pGetThemeFilename       = (PtrGetThemeFilename      )themeLib.resolve("GetThemeFilename");
++            pGetThemeFont           = (PtrGetThemeFont          )themeLib.resolve("GetThemeFont");
++            pGetThemeInt            = (PtrGetThemeInt           )themeLib.resolve("GetThemeInt");
++            pGetThemeIntList        = (PtrGetThemeIntList       )themeLib.resolve("GetThemeIntList");
++            pGetThemeMargins        = (PtrGetThemeMargins       )themeLib.resolve("GetThemeMargins");
++            pGetThemeMetric         = (PtrGetThemeMetric        )themeLib.resolve("GetThemeMetric");
++            pGetThemePartSize       = (PtrGetThemePartSize      )themeLib.resolve("GetThemePartSize");
++            pGetThemePosition       = (PtrGetThemePosition      )themeLib.resolve("GetThemePosition");
++            pGetThemePropertyOrigin = (PtrGetThemePropertyOrigin)themeLib.resolve("GetThemePropertyOrigin");
++            pGetThemeRect           = (PtrGetThemeRect          )themeLib.resolve("GetThemeRect");
++            pGetThemeString         = (PtrGetThemeString        )themeLib.resolve("GetThemeString");
++            pGetThemeBackgroundRegion              = (PtrGetThemeBackgroundRegion             )themeLib.resolve("GetThemeBackgroundRegion");
++            pGetThemeDocumentationProperty         = (PtrGetThemeDocumentationProperty        )themeLib.resolve("GetThemeDocumentationProperty");
++            pIsThemeBackgroundPartiallyTransparent = (PtrIsThemeBackgroundPartiallyTransparent)themeLib.resolve("IsThemeBackgroundPartiallyTransparent");
++        }
++    }
++
++    return pIsAppThemed != 0;
++}
++
+ /*! \internal
+     Returns a native buffer (DIB section) of at least the size of
+     ( \a x , \a y ). The buffer has a 32 bit depth, to not lose
+@@ -511,8 +627,8 @@ HBITMAP QWindowsXPStylePrivate::buffer(int w, int h)
+ */
+ bool QWindowsXPStylePrivate::isTransparent(XPThemeData &themeData)
+ {
+-    return IsThemeBackgroundPartiallyTransparent(themeData.handle(), themeData.partId,
+-                                                 themeData.stateId);
++    return pIsThemeBackgroundPartiallyTransparent(themeData.handle(), themeData.partId,
++                                                  themeData.stateId);
+ }
+ 
+ 
+@@ -524,7 +640,7 @@ QRegion QWindowsXPStylePrivate::region(XPThemeData &themeData)
+     HRGN hRgn = 0;
+     const qreal factor = QWindowsStylePrivate::nativeMetricScaleFactor(themeData.widget);
+     RECT rect = themeData.toRECT(QRect(themeData.rect.topLeft() / factor, themeData.rect.size() / factor));
+-    if (!SUCCEEDED(GetThemeBackgroundRegion(themeData.handle(), bufferHDC(), themeData.partId,
++    if (!SUCCEEDED(pGetThemeBackgroundRegion(themeData.handle(), bufferHDC(), themeData.partId,
+                                             themeData.stateId, &rect, &hRgn))) {
+         return QRegion();
+     }
+@@ -721,6 +837,7 @@ bool QWindowsXPStylePrivate::drawBackground(XPThemeData &themeData)
+     bool canDrawDirectly = false;
+     if (themeData.widget && painter->opacity() == 1.0 && !themeData.rotate
+         && tt != ComplexTransform && !themeData.mirrorVertically
++        && (!themeData.mirrorHorizontally || pDrawThemeBackgroundEx)
+         && !translucentToplevel) {
+         // Draw on backing store DC only for real widgets or backing store images.
+         const QPaintDevice *enginePaintDevice = painter->paintEngine()->paintDevice();
+@@ -801,7 +918,44 @@ bool QWindowsXPStylePrivate::drawBackgroundDirectly(HDC dc, XPThemeData &themeDa
+                           | (themeData.noContent ? DTBG_OMITCONTENT : 0)
+                           | (themeData.mirrorHorizontally ? DTBG_MIRRORDC : 0);
+ 
+-    const HRESULT result = DrawThemeBackgroundEx(themeData.handle(), dc, themeData.partId, themeData.stateId, &(drawRECT), &drawOptions);
++    HRESULT result = S_FALSE;
++    if (pDrawThemeBackgroundEx != 0) {
++        result = pDrawThemeBackgroundEx(themeData.handle(), dc, themeData.partId, themeData.stateId, &(drawRECT), &drawOptions);
++    } else {
++        // We are running on a system where the uxtheme.dll does not have
++        // the DrawThemeBackgroundEx function, so we need to clip away
++        // borders or contents manually. All flips and mirrors uses the
++        // fallback implementation
++
++        int borderSize = 0;
++        PROPERTYORIGIN origin = PO_NOTFOUND;
++        pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &origin);
++        pGetThemeInt(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &borderSize);
++
++        // Clip away border region
++        QRegion extraClip = sysRgn;
++        if ((origin == PO_CLASS || origin == PO_PART || origin == PO_STATE) && borderSize > 0) {
++            if (themeData.noBorder) {
++                // extraClip &= area is already done
++                drawRECT = themeData.toRECT(area.adjusted(-borderSize, -borderSize, borderSize, borderSize));
++            }
++
++            // Clip away content region
++            if (themeData.noContent) {
++                QRegion content = area.adjusted(borderSize, borderSize, -borderSize, -borderSize);
++                extraClip ^= content;
++            }
++
++            // Set the clip region, if used..
++            if (themeData.noBorder || themeData.noContent) {
++                DeleteObject(hrgn);
++                hrgn = qt_hrgn_from_qregion(extraClip);
++                SelectClipRgn(dc, hrgn);
++            }
++        }
++
++        result = pDrawThemeBackground(themeData.handle(), dc, themeData.partId, themeData.stateId, &(drawRECT), &(drawOptions.rcClip));
++    }
+     SelectClipRgn(dc, 0);
+     DeleteObject(hrgn);
+     return SUCCEEDED(result);
+@@ -881,17 +1035,17 @@ bool QWindowsXPStylePrivate::drawBackgroundThruNativeBuffer(XPThemeData &themeDa
+         BOOL tmt_borderonly = false;
+         COLORREF tmt_transparentcolor = 0x0;
+         PROPERTYORIGIN proporigin = PO_NOTFOUND;
+-        GetThemeBool(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERONLY, &tmt_borderonly);
+-        GetThemeColor(themeData.handle(), themeData.partId, themeData.stateId, TMT_TRANSPARENTCOLOR, &tmt_transparentcolor);
+-        GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_CAPTIONMARGINS, &proporigin);
++        pGetThemeBool(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERONLY, &tmt_borderonly);
++        pGetThemeColor(themeData.handle(), themeData.partId, themeData.stateId, TMT_TRANSPARENTCOLOR, &tmt_transparentcolor);
++        pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_CAPTIONMARGINS, &proporigin);
+ 
+         partIsTransparent = isTransparent(themeData);
+ 
+         potentialInvalidAlpha = false;
+-        GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_GLYPHTYPE, &proporigin);
++        pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_GLYPHTYPE, &proporigin);
+         if (proporigin == PO_PART || proporigin == PO_STATE) {
+             int tmt_glyphtype = GT_NONE;
+-            GetThemeEnumValue(themeData.handle(), themeData.partId, themeData.stateId, TMT_GLYPHTYPE, &tmt_glyphtype);
++            pGetThemeEnumValue(themeData.handle(), themeData.partId, themeData.stateId, TMT_GLYPHTYPE, &tmt_glyphtype);
+             potentialInvalidAlpha = partIsTransparent && tmt_glyphtype == GT_IMAGEGLYPH;
+         }
+ 
+@@ -921,8 +1075,8 @@ bool QWindowsXPStylePrivate::drawBackgroundThruNativeBuffer(XPThemeData &themeDa
+ 
+         int borderSize = 0;
+         PROPERTYORIGIN origin = PO_NOTFOUND;
+-        GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &origin);
+-        GetThemeInt(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &borderSize);
++        pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &origin);
++        pGetThemeInt(themeData.handle(), themeData.partId, themeData.stateId, TMT_BORDERSIZE, &borderSize);
+ 
+         // Clip away border region
+         if ((origin == PO_CLASS || origin == PO_PART || origin == PO_STATE) && borderSize > 0) {
+@@ -955,6 +1109,8 @@ bool QWindowsXPStylePrivate::drawBackgroundThruNativeBuffer(XPThemeData &themeDa
+         // Difference between area and rect
+         int dx = area.x() - rect.x();
+         int dy = area.y() - rect.y();
++        int dr = area.right() - rect.right();
++        int db = area.bottom() - rect.bottom();
+ 
+         // Adjust so painting rect starts from Origo
+         rect.moveTo(0,0);
+@@ -967,8 +1123,24 @@ bool QWindowsXPStylePrivate::drawBackgroundThruNativeBuffer(XPThemeData &themeDa
+                             | (themeData.noContent ? DTBG_OMITCONTENT : 0);
+ 
+         // Drawing the part into the backing store
+-        RECT wRect(themeData.toRECT(area));
+-        DrawThemeBackgroundEx(themeData.handle(), dc, themeData.partId, themeData.stateId, &wRect, &drawOptions);
++        if (pDrawThemeBackgroundEx != 0) {
++            RECT rect(themeData.toRECT(area));
++            pDrawThemeBackgroundEx(themeData.handle(), dc, themeData.partId, themeData.stateId, &rect, &drawOptions);
++        } else {
++            // Set the clip region, if used..
++            if (addBorderContentClipping) {
++                HRGN hrgn = qt_hrgn_from_qregion(extraClip);
++                SelectClipRgn(dc, hrgn);
++                // Compensate for the noBorder area difference (noContent has the same area)
++                drawOptions.rcClip = themeData.toRECT(rect.adjusted(dx, dy, dr, db));
++                DeleteObject(hrgn);
++            }
++
++            pDrawThemeBackground(themeData.handle(), dc, themeData.partId, themeData.stateId, &(drawOptions.rcClip), 0);
++
++            if (addBorderContentClipping)
++                SelectClipRgn(dc, 0);
++        }
+ 
+         // If not cached, analyze the buffer data to figure
+         // out alpha type, and if it contains data
+@@ -1188,12 +1360,12 @@ void QWindowsXPStyle::polish(QWidget *widget)
+         // Get text color for group box labels
+         COLORREF cref;
+         XPThemeData theme(widget, 0, QWindowsXPStylePrivate::ButtonTheme, 0, 0);
+-        GetThemeColor(theme.handle(), BP_GROUPBOX, GBS_NORMAL, TMT_TEXTCOLOR, &cref);
++        QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), BP_GROUPBOX, GBS_NORMAL, TMT_TEXTCOLOR, &cref);
+         d->groupBoxTextColor = qRgb(GetRValue(cref), GetGValue(cref), GetBValue(cref));
+-        GetThemeColor(theme.handle(), BP_GROUPBOX, GBS_DISABLED, TMT_TEXTCOLOR, &cref);
++        QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), BP_GROUPBOX, GBS_DISABLED, TMT_TEXTCOLOR, &cref);
+         d->groupBoxTextColorDisabled = qRgb(GetRValue(cref), GetGValue(cref), GetBValue(cref));
+         // Where does this color come from?
+-        //GetThemeColor(theme.handle(), TKP_TICS, TSS_NORMAL, TMT_COLOR, &cref);
++        //pGetThemeColor(theme.handle(), TKP_TICS, TSS_NORMAL, TMT_COLOR, &cref);
+         d->sliderTickColor = qRgb(165, 162, 148);
+         d->hasInitColors = true;
+     }
+@@ -1318,7 +1490,15 @@ QRect QWindowsXPStyle::subElementRect(SubElement sr, const QStyleOption *option,
+                     int border = proxy()->pixelMetric(PM_DefaultFrameWidth, btn, widget);
+                     rect = option->rect.adjusted(border, border, -border, -border);
+ 
+-                    if (SUCCEEDED(GetThemeMargins(theme, NULL, BP_PUSHBUTTON, stateId, TMT_CONTENTMARGINS, NULL, &borderSize))) {
++                    int result = QWindowsXPStylePrivate::pGetThemeMargins(theme,
++                                                  NULL,
++                                                  BP_PUSHBUTTON,
++                                                  stateId,
++                                                  TMT_CONTENTMARGINS,
++                                                  NULL,
++                                                  &borderSize);
++
++                    if (result == S_OK) {
+                         rect.adjust(borderSize.cxLeftWidth, borderSize.cyTopHeight,
+                                     -borderSize.cxRightWidth, -borderSize.cyBottomHeight);
+                         rect = visualRect(option->direction, option->rect, rect);
+@@ -1505,14 +1685,14 @@ case PE_Frame:
+         else
+             stateId = ETS_NORMAL;
+         int fillType;
+-        if (GetThemeEnumValue(theme.handle(), partId, stateId, TMT_BGTYPE, &fillType) == S_OK) {
++        if (QWindowsXPStylePrivate::pGetThemeEnumValue(theme.handle(), partId, stateId, TMT_BGTYPE, &fillType) == S_OK) {
+             if (fillType == BT_BORDERFILL) {
+                 COLORREF bcRef;
+-                GetThemeColor(theme.handle(), partId, stateId, TMT_BORDERCOLOR, &bcRef);
++                QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), partId, stateId, TMT_BORDERCOLOR, &bcRef);
+                 QColor bordercolor(qRgb(GetRValue(bcRef), GetGValue(bcRef), GetBValue(bcRef)));
+                 QPen oldPen = p->pen();
+                 // int borderSize = 1;
+-                // GetThemeInt(theme.handle(), partId, stateId, TMT_BORDERCOLOR, &borderSize);
++                // pGetThemeInt(theme.handle(), partId, stateId, TMT_BORDERCOLOR, &borderSize);
+ 
+                 // Inner white border
+                 p->setPen(QPen(option->palette.base().color(), 1));
+@@ -1570,7 +1750,11 @@ case PE_Frame:
+                     return;
+                 }
+                 int bgType;
+-                GetThemeEnumValue(theme.handle(), partId, stateId, TMT_BGTYPE, &bgType);
++                QWindowsXPStylePrivate::pGetThemeEnumValue( theme.handle(),
++                                    partId,
++                                    stateId,
++                                    TMT_BGTYPE,
++                                    &bgType);
+                 if( bgType == BT_IMAGEFILE ) {
+                     theme.mirrorHorizontally = hMirrored;
+                     theme.mirrorVertically = vMirrored;
+@@ -1583,11 +1767,11 @@ case PE_Frame:
+ 
+                     if (!isEnabled) {
+                         PROPERTYORIGIN origin = PO_NOTFOUND;
+-                        GetThemePropertyOrigin(theme.handle(), theme.partId, theme.stateId, TMT_FILLCOLOR, &origin);
++                        QWindowsXPStylePrivate::pGetThemePropertyOrigin(theme.handle(), theme.partId, theme.stateId, TMT_FILLCOLOR, &origin);
+                         // Use only if the fill property comes from our part
+                         if ((origin == PO_PART || origin == PO_STATE)) {
+                             COLORREF bgRef;
+-                            GetThemeColor(theme.handle(), partId, stateId, TMT_FILLCOLOR, &bgRef);
++                            QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), partId, stateId, TMT_FILLCOLOR, &bgRef);
+                             fillColor = QBrush(qRgb(GetRValue(bgRef), GetGValue(bgRef), GetBValue(bgRef)));
+                         }
+                     }
+@@ -1613,7 +1797,7 @@ case PE_Frame:
+                 wchar_t themeFileName[maxlength];
+                 wchar_t themeColor[maxlength];
+                 // Due to a a scaling issue with the XP Silver theme, tab gradients are not used with it
+-                if (GetCurrentThemeName(themeFileName, maxlength, themeColor, maxlength, NULL, 0) == S_OK) {
++                if (QWindowsXPStylePrivate::pGetCurrentThemeName(themeFileName, maxlength, themeColor, maxlength, NULL, 0) == S_OK) {
+                     wchar_t *offset = 0;
+                     if ((offset = wcsrchr(themeFileName, QChar(QLatin1Char('\\')).unicode())) != NULL) {
+                         offset++;
+@@ -2400,10 +2584,10 @@ void QWindowsXPStyle::drawControl(ControlElement element, const QStyleOption *op
+                         = p->fontMetrics().elidedText(dwOpt->title, Qt::ElideRight, titleRect.width());
+ 
+                     int result = TST_NONE;
+-                    GetThemeEnumValue(theme.handle(), WP_SMALLCAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWTYPE, &result);
++                    QWindowsXPStylePrivate::pGetThemeEnumValue(theme.handle(), WP_SMALLCAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWTYPE, &result);
+                     if (result != TST_NONE) {
+                         COLORREF textShadowRef;
+-                        GetThemeColor(theme.handle(), WP_SMALLCAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWCOLOR, &textShadowRef);
++                        QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), WP_SMALLCAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWCOLOR, &textShadowRef);
+                         QColor textShadow = qRgb(GetRValue(textShadowRef), GetGValue(textShadowRef), GetBValue(textShadowRef));
+                         p->setPen(textShadow);
+                         drawItemText(p, titleRect.adjusted(1, 1, 1, 1),
+@@ -3001,10 +3185,10 @@ void QWindowsXPStyle::drawComplexControl(ComplexControl cc, const QStyleOptionCo
+                     QRect ir = proxy()->subControlRect(CC_TitleBar, tb, SC_TitleBarLabel, widget);
+ 
+                     int result = TST_NONE;
+-                    GetThemeEnumValue(theme.handle(), WP_CAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWTYPE, &result);
++                    QWindowsXPStylePrivate::pGetThemeEnumValue(theme.handle(), WP_CAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWTYPE, &result);
+                     if (result != TST_NONE) {
+                         COLORREF textShadowRef;
+-                        GetThemeColor(theme.handle(), WP_CAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWCOLOR, &textShadowRef);
++                        QWindowsXPStylePrivate::pGetThemeColor(theme.handle(), WP_CAPTION, isActive ? CS_ACTIVE : CS_INACTIVE, TMT_TEXTSHADOWCOLOR, &textShadowRef);
+                         QColor textShadow = qRgb(GetRValue(textShadowRef), GetGValue(textShadowRef), GetBValue(textShadowRef));
+                         p->setPen(textShadow);
+                         p->drawText(int(ir.x() + 3 * factor), int(ir.y() + 2 * factor),
+@@ -4038,7 +4222,7 @@ void QWindowsXPStylePrivate::dumpNativeDIB(int w, int h)
+ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+ {
+     PROPERTYORIGIN origin = PO_NOTFOUND;
+-    GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
++    pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
+     const char *originStr;
+     switch(origin) {
+     case PO_STATE:
+@@ -4063,35 +4247,35 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+     case TMT_STRING:
+         {
+             wchar_t buffer[512];
+-            GetThemeString(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, buffer, 512);
++            pGetThemeString(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, buffer, 512);
+             printf("  (%sString)  %-20S: %S\n", originStr, prop.propName, buffer);
+         }
+         break;
+     case TMT_ENUM:
+         {
+             int result = -1;
+-            GetThemeEnumValue(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeEnumValue(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sEnum)    %-20S: %d\n", originStr, prop.propName, result);
+         }
+         break;
+     case TMT_INT:
+         {
+             int result = -1;
+-            GetThemeInt(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeInt(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sint)     %-20S: %d\n", originStr, prop.propName, result);
+         }
+         break;
+     case TMT_BOOL:
+         {
+             BOOL result = false;
+-            GetThemeBool(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeBool(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sbool)    %-20S: %d\n", originStr, prop.propName, result);
+         }
+         break;
+     case TMT_COLOR:
+         {
+             COLORREF result = 0;
+-            GetThemeColor(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeColor(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%scolor)   %-20S: 0x%08X\n", originStr, prop.propName, result);
+         }
+         break;
+@@ -4099,7 +4283,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+         {
+             MARGINS result;
+             memset(&result, 0, sizeof(result));
+-            GetThemeMargins(themeData.handle(), 0, themeData.partId, themeData.stateId, prop.propValue, 0, &result);
++            pGetThemeMargins(themeData.handle(), 0, themeData.partId, themeData.stateId, prop.propValue, 0, &result);
+             printf("  (%smargins) %-20S: (%d, %d, %d, %d)\n", originStr,
+                    prop.propName, result.cxLeftWidth, result.cyTopHeight, result.cxRightWidth, result.cyBottomHeight);
+         }
+@@ -4107,7 +4291,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+     case TMT_FILENAME:
+         {
+             wchar_t buffer[512];
+-            GetThemeFilename(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, buffer, 512);
++            pGetThemeFilename(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, buffer, 512);
+             printf("  (%sfilename)%-20S: %S\n", originStr, prop.propName, buffer);
+         }
+         break;
+@@ -4119,9 +4303,9 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+             memset(&result1, 0, sizeof(result1));
+             memset(&result2, 0, sizeof(result2));
+             memset(&result3, 0, sizeof(result3));
+-            GetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_MIN,  &result1);
+-            GetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_TRUE, &result2);
+-            GetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_DRAW, &result3);
++            pGetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_MIN,  &result1);
++            pGetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_TRUE, &result2);
++            pGetThemePartSize(themeData.handle(), 0, themeData.partId, themeData.stateId, 0, TS_DRAW, &result3);
+             printf("  (%ssize)    %-20S: Min (%d, %d),  True(%d, %d),  Draw(%d, %d)\n", originStr, prop.propName,
+                    result1.cx, result1.cy, result2.cx, result2.cy, result3.cx, result3.cy);
+         }
+@@ -4130,7 +4314,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+         {
+             POINT result;
+             memset(&result, 0, sizeof(result));
+-            GetThemePosition(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemePosition(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sPosition)%-20S: (%d, %d)\n", originStr, prop.propName, result.x, result.y);
+         }
+         break;
+@@ -4138,7 +4322,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+         {
+             RECT result;
+             memset(&result, 0, sizeof(result));
+-            GetThemeRect(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeRect(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sRect)    %-20S: (%d, %d, %d, %d)\n", originStr, prop.propName, result.left, result.top, result.right, result.bottom);
+         }
+         break;
+@@ -4146,7 +4330,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+         {
+             LOGFONT result;
+             memset(&result, 0, sizeof(result));
+-            GetThemeFont(themeData.handle(), 0, themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeFont(themeData.handle(), 0, themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sFont)    %-20S: %S  height(%d)  width(%d)  weight(%d)\n", originStr, prop.propName,
+                    result.lfFaceName, result.lfHeight, result.lfWidth, result.lfWeight);
+         }
+@@ -4155,7 +4339,7 @@ static void showProperty(XPThemeData &themeData, const PropPair &prop)
+         {
+             INTLIST result;
+             memset(&result, 0, sizeof(result));
+-            GetThemeIntList(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
++            pGetThemeIntList(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &result);
+             printf("  (%sInt list)%-20S: { ", originStr, prop.propName);
+             for (int i = 0; i < result.iValueCount; ++i)
+                 printf("%d ", result.iValues[i]);
+@@ -4207,7 +4391,7 @@ void QWindowsXPStylePrivate::showProperties(XPThemeData &themeData)
+             for (int j = 0; j < all_props.count(); ++j) {
+                 PropPair prop = all_props.at(j);
+                 wchar_t buf[500];
+-                GetThemeDocumentationProperty(themeName, prop.propName, buf, 500);
++                pGetThemeDocumentationProperty(themeName, prop.propName, buf, 500);
+                 printf("%3d: (%4d) %-20S %S\n", j, prop.propValue, prop.propName, buf);
+             }
+         }
+@@ -4217,7 +4401,7 @@ void QWindowsXPStylePrivate::showProperties(XPThemeData &themeData)
+             for (int j = 0; j < all_props.count(); ++j) {
+                 PropPair prop = all_props.at(j);
+                 PROPERTYORIGIN origin = PO_NOTFOUND;
+-                GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
++                pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
+                 if (origin == PO_GLOBAL) {
+                     showProperty(themeData, prop);
+                 }
+@@ -4228,7 +4412,7 @@ void QWindowsXPStylePrivate::showProperties(XPThemeData &themeData)
+     for (int j = 0; j < all_props.count(); ++j) {
+         PropPair prop = all_props.at(j);
+         PROPERTYORIGIN origin = PO_NOTFOUND;
+-        GetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
++        pGetThemePropertyOrigin(themeData.handle(), themeData.partId, themeData.stateId, prop.propValue, &origin);
+         if (origin != PO_NOTFOUND)
+         {
+             showProperty(themeData, prop);
+diff --git a/src/widgets/styles/qwindowsxpstyle_p_p.h b/src/widgets/styles/qwindowsxpstyle_p_p.h
+index fb5210cb07..a023fe6499 100644
+--- a/src/widgets/styles/qwindowsxpstyle_p_p.h
++++ b/src/widgets/styles/qwindowsxpstyle_p_p.h
+@@ -58,12 +58,97 @@
+ #include <qt_windows.h>
+ 
+ #include <uxtheme.h>
++
+ #include <vssym32.h>
+ 
+ #include <limits.h>
+ 
+ QT_BEGIN_NAMESPACE
+ 
++// Older Platform SDKs do not have the extended DrawThemeBackgroundEx
++// function. We add the needed parts here, and use the extended
++// function dynamically, if available in uxtheme.dll. Else, we revert
++// back to using the DrawThemeBackground function.
++#ifndef DTBG_OMITBORDER
++#  ifndef DTBG_CLIPRECT
++#   define DTBG_CLIPRECT        0x00000001
++#  endif
++#  ifndef DTBG_DRAWSOLID
++#   define DTBG_DRAWSOLID       0x00000002
++#  endif
++#  ifndef DTBG_OMITBORDER
++#   define DTBG_OMITBORDER      0x00000004
++#  endif
++#  ifndef DTBG_OMITCONTENT
++#   define DTBG_OMITCONTENT     0x00000008
++#  endif
++#  ifndef DTBG_COMPUTINGREGION
++#   define DTBG_COMPUTINGREGION 0x00000010
++#  endif
++#  ifndef DTBG_MIRRORDC
++#   define DTBG_MIRRORDC        0x00000020
++#  endif
++    typedef struct _DTBGOPTS
++    {
++        DWORD dwSize;
++        DWORD dwFlags;
++        RECT rcClip;
++    } DTBGOPTS, *PDTBGOPTS;
++#endif // _DTBGOPTS
++
++// Undefined for some compile environments
++#ifndef TMT_TEXTCOLOR
++#  define TMT_TEXTCOLOR 3803
++#endif
++#ifndef TMT_BORDERCOLORHINT
++#  define TMT_BORDERCOLORHINT 3822
++#endif
++#ifndef TMT_BORDERSIZE
++#  define TMT_BORDERSIZE 2403
++#endif
++#ifndef TMT_BORDERONLY
++#  define TMT_BORDERONLY 2203
++#endif
++#ifndef TMT_TRANSPARENTCOLOR
++#  define TMT_TRANSPARENTCOLOR 3809
++#endif
++#ifndef TMT_CAPTIONMARGINS
++#  define TMT_CAPTIONMARGINS 3603
++#endif
++#ifndef TMT_CONTENTMARGINS
++#  define TMT_CONTENTMARGINS 3602
++#endif
++#ifndef TMT_SIZINGMARGINS
++#  define TMT_SIZINGMARGINS 3601
++#endif
++#ifndef TMT_GLYPHTYPE
++#  define TMT_GLYPHTYPE 4012
++#endif
++#ifndef TMT_BGTYPE
++#  define TMT_BGTYPE 4001
++#endif
++#ifndef TMT_TEXTSHADOWTYPE
++#    define TMT_TEXTSHADOWTYPE 4010
++#endif
++#ifndef TMT_BORDERCOLOR
++#    define TMT_BORDERCOLOR 3801
++#endif
++#ifndef BT_IMAGEFILE
++#  define BT_IMAGEFILE 0
++#endif
++#ifndef BT_BORDERFILL
++#  define BT_BORDERFILL 1
++#endif
++#ifndef BT_NONE
++#  define BT_NONE 2
++#endif
++#ifndef TMT_FILLCOLOR
++#  define TMT_FILLCOLOR 3802
++#endif
++#ifndef TMT_PROGRESSCHUNKSIZE
++#  define TMT_PROGRESSCHUNKSIZE 2411
++#endif
++
+ // TMT_TEXTSHADOWCOLOR is wrongly defined in mingw
+ #if TMT_TEXTSHADOWCOLOR != 3818
+ #undef TMT_TEXTSHADOWCOLOR
+@@ -73,6 +158,13 @@ QT_BEGIN_NAMESPACE
+ #  define TST_NONE 0
+ #endif
+ 
++#ifndef GT_NONE
++#  define GT_NONE 0
++#endif
++#ifndef GT_IMAGEGLYPH
++#  define GT_IMAGEGLYPH 1
++#endif
++
+ // These defines are missing from the tmschema, but still exist as
+ // states for their parts
+ #ifndef MINBS_INACTIVE
+@@ -183,7 +275,65 @@ struct ThemeMapData {
+                      hasAlphaChannel(false), wasAlphaSwapped(false), hadInvalidAlpha(false) {}
+ };
+ 
+-class QWindowsXPStylePrivate : public QWindowsStylePrivate
++struct QWindowsUxThemeLib {
++    typedef bool (WINAPI *PtrIsAppThemed)();
++    typedef bool (WINAPI *PtrIsThemeActive)();
++    typedef HTHEME (WINAPI *PtrOpenThemeData)(HWND hwnd, LPCWSTR pszClassList);
++    typedef HRESULT (WINAPI *PtrCloseThemeData)(HTHEME hTheme);
++    typedef HRESULT (WINAPI *PtrDrawThemeBackground)(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT *pRect, OPTIONAL const RECT *pClipRect);
++    typedef HRESULT (WINAPI *PtrDrawThemeBackgroundEx)(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, const RECT *pRect, OPTIONAL const DTBGOPTS *pOptions);
++    typedef HRESULT (WINAPI *PtrGetCurrentThemeName)(OUT LPWSTR pszThemeFileName, int cchMaxNameChars, OUT OPTIONAL LPWSTR pszColorBuff, int cchMaxColorChars, OUT OPTIONAL LPWSTR pszSizeBuff, int cchMaxSizeChars);
++    typedef HRESULT (WINAPI *PtrGetThemeDocumentationProperty)(LPCWSTR pszThemeName, LPCWSTR pszPropertyName, OUT LPWSTR pszValueBuff, int cchMaxValChars);
++    typedef HRESULT (WINAPI *PtrGetThemeBool)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT BOOL *pfVal);
++    typedef HRESULT (WINAPI *PtrGetThemeColor)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT COLORREF *pColor);
++    typedef HRESULT (WINAPI *PtrGetThemeEnumValue)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT int *piVal);
++    typedef HRESULT (WINAPI *PtrGetThemeFilename)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT LPWSTR pszThemeFileName, int cchMaxBuffChars);
++    typedef HRESULT (WINAPI *PtrGetThemeFont)(HTHEME hTheme, OPTIONAL HDC hdc, int iPartId, int iStateId, int iPropId, OUT LOGFONT *pFont);
++    typedef HRESULT (WINAPI *PtrGetThemeInt)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT int *piVal);
++    typedef HRESULT (WINAPI *PtrGetThemeIntList)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT INTLIST *pIntList);
++    typedef HRESULT (WINAPI *PtrGetThemeMargins)(HTHEME hTheme, OPTIONAL HDC hdc, int iPartId, int iStateId, int iPropId, OPTIONAL RECT *prc, OUT MARGINS *pMargins);
++    typedef HRESULT (WINAPI *PtrGetThemeMetric)(HTHEME hTheme, OPTIONAL HDC hdc, int iPartId, int iStateId, int iPropId, OUT int *piVal);
++    typedef HRESULT (WINAPI *PtrGetThemePartSize)(HTHEME hTheme, HDC hdc, int iPartId, int iStateId, OPTIONAL RECT *prc, enum THEMESIZE eSize, OUT SIZE *psz);
++    typedef HRESULT (WINAPI *PtrGetThemePosition)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT POINT *pPoint);
++    typedef HRESULT (WINAPI *PtrGetThemePropertyOrigin)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT enum PROPERTYORIGIN *pOrigin);
++    typedef HRESULT (WINAPI *PtrGetThemeRect)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT RECT *pRect);
++    typedef HRESULT (WINAPI *PtrGetThemeString)(HTHEME hTheme, int iPartId, int iStateId, int iPropId, OUT LPWSTR pszBuff, int cchMaxBuffChars);
++    typedef HRESULT (WINAPI *PtrGetThemeBackgroundRegion)(HTHEME hTheme, OPTIONAL HDC hdc, int iPartId, int iStateId, const RECT *pRect, OUT HRGN *pRegion);
++    typedef BOOL (WINAPI *PtrIsThemeBackgroundPartiallyTransparent)(HTHEME hTheme, int iPartId, int iStateId);
++    typedef HRESULT (WINAPI *PtrSetWindowTheme)(HWND hwnd, LPCWSTR pszSubAppName, LPCWSTR pszSubIdList);
++    typedef HRESULT (WINAPI *PtrGetThemeTransitionDuration)(HTHEME hTheme, int iPartId, int iStateFromId, int iStateToId, int iPropId, DWORD *pDuration);
++
++    static bool resolveSymbols();
++
++    static PtrIsAppThemed pIsAppThemed;
++    static PtrIsThemeActive pIsThemeActive;
++    static PtrOpenThemeData pOpenThemeData;
++    static PtrCloseThemeData pCloseThemeData;
++    static PtrDrawThemeBackground pDrawThemeBackground;
++    static PtrDrawThemeBackgroundEx pDrawThemeBackgroundEx;
++    static PtrGetCurrentThemeName pGetCurrentThemeName;
++    static PtrGetThemeBool pGetThemeBool;
++    static PtrGetThemeColor pGetThemeColor;
++    static PtrGetThemeEnumValue pGetThemeEnumValue;
++    static PtrGetThemeFilename pGetThemeFilename;
++    static PtrGetThemeFont pGetThemeFont;
++    static PtrGetThemeInt pGetThemeInt;
++    static PtrGetThemeIntList pGetThemeIntList;
++    static PtrGetThemeMargins pGetThemeMargins;
++    static PtrGetThemeMetric pGetThemeMetric;
++    static PtrGetThemePartSize pGetThemePartSize;
++    static PtrGetThemePosition pGetThemePosition;
++    static PtrGetThemePropertyOrigin pGetThemePropertyOrigin;
++    static PtrGetThemeRect pGetThemeRect;
++    static PtrGetThemeString pGetThemeString;
++    static PtrGetThemeBackgroundRegion pGetThemeBackgroundRegion;
++    static PtrGetThemeDocumentationProperty pGetThemeDocumentationProperty;
++    static PtrIsThemeBackgroundPartiallyTransparent pIsThemeBackgroundPartiallyTransparent;
++    static PtrSetWindowTheme pSetWindowTheme;
++    static PtrGetThemeTransitionDuration pGetThemeTransitionDuration; // Windows Vista onwards.
++};
++
++class QWindowsXPStylePrivate : public QWindowsStylePrivate, public QWindowsUxThemeLib
+ {
+     Q_DECLARE_PUBLIC(QWindowsXPStyle)
+ public:
+@@ -232,6 +382,7 @@ public:
+     HDC bufferHDC()
+     { return bufferDC;}
+ 
++    static bool resolveSymbols();
+     static bool useXP(bool update = false);
+     static QRect scrollBarGripperBounds(QStyle::State flags, const QWidget *widget, XPThemeData *theme);
+ 
+@@ -289,7 +440,7 @@ inline QSizeF XPThemeData::size()
+     QSizeF result(0, 0);
+     if (isValid()) {
+         SIZE size;
+-        if (SUCCEEDED(GetThemePartSize(handle(), 0, partId, stateId, 0, TS_TRUE, &size)))
++        if (SUCCEEDED(QWindowsXPStylePrivate::pGetThemePartSize(handle(), 0, partId, stateId, 0, TS_TRUE, &size)))
+             result = QSize(size.cx, size.cy);
+     }
+     return result;
+@@ -301,7 +452,7 @@ inline QMarginsF XPThemeData::margins(const QRect &qRect, int propId)
+     if (isValid()) {
+         MARGINS margins;
+         RECT rect = XPThemeData::toRECT(qRect);
+-        if (SUCCEEDED(GetThemeMargins(handle(), 0, partId, stateId, propId, &rect, &margins)))
++        if (SUCCEEDED(QWindowsXPStylePrivate::pGetThemeMargins(handle(), 0, partId, stateId, propId, &rect, &margins)))
+             result = QMargins(margins.cxLeftWidth, margins.cyTopHeight, margins.cxRightWidth, margins.cyBottomHeight);
+     }
+     return result;
+@@ -312,7 +463,7 @@ inline QMarginsF XPThemeData::margins(int propId)
+     QMarginsF result(0, 0, 0 ,0);
+     if (isValid()) {
+         MARGINS margins;
+-        if (SUCCEEDED(GetThemeMargins(handle(), 0, partId, stateId, propId, NULL, &margins)))
++        if (SUCCEEDED(QWindowsXPStylePrivate::pGetThemeMargins(handle(), 0, partId, stateId, propId, NULL, &margins)))
+             result = QMargins(margins.cxLeftWidth, margins.cyTopHeight, margins.cxRightWidth, margins.cyBottomHeight);
+     }
+     return result;
+diff --git a/src/widgets/util/qsystemtrayicon_win.cpp b/src/widgets/util/qsystemtrayicon_win.cpp
+index 57d46912e0..cefba86616 100644
+--- a/src/widgets/util/qsystemtrayicon_win.cpp
++++ b/src/widgets/util/qsystemtrayicon_win.cpp
+@@ -87,6 +87,10 @@ struct Q_NOTIFYICONIDENTIFIER {
+ #    define NOTIFYICON_VERSION_4 4
+ #endif
+ 
++#ifndef NOTIFYICON_VERSION_4
++#  define NOTIFYICON_VERSION_4 4
++#endif
++
+ #define Q_MSGFLT_ALLOW 1
+ 
+ Q_GUI_EXPORT HICON qt_pixmapToWinHICON(const QPixmap &);
+@@ -242,6 +246,18 @@ void QSystemTrayIconSys::setIconContents(NOTIFYICONDATA &tnd)
+         qStringToLimitedWCharArray(tip, tnd.szTip, sizeof(tnd.szTip)/sizeof(wchar_t));
+ }
+ 
++#ifndef NIIF_LARGE_ICON
++#  define NIIF_LARGE_ICON 0x00000020
++#endif
++
++#ifndef NIIF_USER
++#  define NIIF_USER 0x00000004
++#endif
++
++#ifndef NIF_SHOWTIP
++#  define NIF_SHOWTIP 0x00000080
++#endif
++
+ bool QSystemTrayIconSys::showMessage(const QString &title, const QString &message, const QIcon &icon, uint uSecs)
+ {
+     NOTIFYICONDATA tnd;
+@@ -261,7 +277,8 @@ bool QSystemTrayIconSys::showMessage(const QString &title, const QString &messag
+             tnd.dwInfoFlags |= NIIF_LARGE_ICON;
+             size = largeIcon;
+         }
+-        phIcon = &tnd.hBalloonIcon;
++        // TODO:
++        // phIcon = &tnd.hBalloonIcon;
+     }
+     QPixmap pm = icon.pixmap(size);
+     if (pm.isNull()) {
