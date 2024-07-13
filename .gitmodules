@@ -1,0 +1,34 @@
+[submodule "qtbase"]
+	path = qtbase
+	url = https://github.com/qt/qtbase
+	branch = 5.9
+	status = essential
+[submodule "qtsvg"]
+	depends = qtbase
+	path = qtsvg
+	url = https://github.com/qt/qtsvg
+	branch = 5.9
+	status = addon
+[submodule "qttools"]
+	depends = qtbase
+	path = qttools
+	url = https://github.com/qt/qttools
+	branch = 5.9
+	status = essential
+[submodule "qtdoc"]
+	depends = qtbase
+	path = qtdoc
+	url = https://github.com/qt/qtdoc
+	branch = 5.9
+[submodule "qttranslations"]
+	depends = qttools
+	path = qttranslations
+	url = https://github.com/qt/qttranslations
+	branch = 5.9
+	status = essential
+[submodule "qtmultimedia"]
+	depends = qtbase
+	path = qtmultimedia
+	url = https://github.com/qt/qtmultimedia
+	branch = 5.9
+	status = essential
